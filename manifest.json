@@ -1,0 +1,12 @@
+{
+  "display_name": "聊天总结助手",
+  "loading_order": 10,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "ChatSummary",
+  "version": "1.0.0",
+  "homePage": "",
+  "auto_update": true
+}
