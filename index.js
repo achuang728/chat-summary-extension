@@ -1,6 +1,9 @@
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 
+// 世界书模块 - 动态获取
+let worldInfoModule = null;
+
 const extensionName = "chat-summary-extension";
 
 // 默认设置
@@ -76,7 +79,49 @@ function getSettings() {
 
 // ============ API调用 ============
 
+async function callCustomApi(prompt) {
+  const settings = getSettings();
+  
+  if (!settings.apiUrl || !settings.apiKey || !settings.apiModel) {
+    throw new Error("请先配置API地址、密钥和模型");
+  }
+  
+  let baseUrl = settings.apiUrl.trim().replace(/\/+$/, "");
+  let endpoint = baseUrl.includes("/v1") ? `${baseUrl}/chat/completions` : `${baseUrl}/v1/chat/completions`;
+  
+  console.log("[聊天总结] 调用自定义API:", endpoint);
+  
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${settings.apiKey}`
+    },
+    body: JSON.stringify({
+      model: settings.apiModel,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 2000,
+      temperature: 0.7
+    })
+  });
+  
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`API错误 ${response.status}: ${errorText}`);
+  }
+  
+  const data = await response.json();
+  return data.choices[0].message.content;
+}
+
 async function callAI(prompt) {
+  const settings = getSettings();
+  
+  if (settings.useCustomApi && settings.apiUrl && settings.apiKey && settings.apiModel) {
+    return await callCustomApi(prompt);
+  }
+  
+  // 使用酒馆API
   const context = getContext();
   return await context.generateQuietPrompt(prompt, false, false);
 }
@@ -86,38 +131,30 @@ async function callAI(prompt) {
 async function getWorldbooks() {
   const worldbookList = [];
   
-  // 从世界书下拉框获取
-  try {
-    $("#world_info option, #world_editor_select option").each(function() {
-      const val = $(this).val();
-      const text = $(this).text().trim();
-      if (val && text && val !== "" && text !== "None" && text !== "无" && !text.includes("选择")) {
-        if (!worldbookList.find(w => w.name === val)) {
-          worldbookList.push({ name: val, displayName: text });
-        }
-      }
-    });
-  } catch (e) {
-    console.log("[聊天总结] DOM获取失败:", e.message);
-  }
-  
-  // 从角色世界书获取
-  try {
-    const context = getContext();
-    if (context.characters && context.characterId !== undefined) {
-      const char = context.characters[context.characterId];
-      if (char?.data?.extensions?.world) {
-        const charWorld = char.data.extensions.world;
-        if (charWorld && !worldbookList.find(w => w.name === charWorld)) {
-          worldbookList.push({ name: charWorld, displayName: `${charWorld} (角色)` });
-        }
+  // 从DOM获取
+  $("#world_info option, #world_editor_select option").each(function() {
+    const val = $(this).val();
+    const text = $(this).text().trim();
+    if (val && text && val !== "" && text !== "None" && text !== "无" && !text.includes("选择")) {
+      if (!worldbookList.find(w => w.name === val)) {
+        worldbookList.push({ name: val, displayName: text });
       }
     }
-  } catch (e) {
-    console.log("[聊天总结] 角色世界书获取失败:", e.message);
+  });
+  
+  // 从角色获取
+  const context = getContext();
+  if (context.characters && context.characterId !== undefined) {
+    const char = context.characters[context.characterId];
+    if (char?.data?.extensions?.world) {
+      const charWorld = char.data.extensions.world;
+      if (!worldbookList.find(w => w.name === charWorld)) {
+        worldbookList.push({ name: charWorld, displayName: `${charWorld} (角色)` });
+      }
+    }
   }
   
-  console.log("[聊天总结] 找到世界书:", worldbookList);
+  console.log("[聊天总结] 世界书列表:", worldbookList);
   return worldbookList;
 }
 
@@ -125,17 +162,9 @@ async function updateWorldbookSelect() {
   const settings = getSettings();
   const $select = $("#chat_summary_worldbook");
   
-  $select.empty();
-  $select.append(`<option value="">-- 选择世界书 --</option>`);
-  
-  toastr.info("正在获取世界书列表...", "聊天总结");
+  $select.empty().append(`<option value="">-- 选择世界书 --</option>`);
   
   const worldbooks = await getWorldbooks();
-  
-  if (worldbooks.length === 0) {
-    toastr.warning("未找到世界书", "聊天总结");
-    return;
-  }
   
   worldbooks.forEach(wb => {
     $select.append(`<option value="${wb.name}">${wb.displayName}</option>`);
@@ -148,376 +177,201 @@ async function updateWorldbookSelect() {
   toastr.success(`找到 ${worldbooks.length} 个世界书`, "聊天总结");
 }
 
-// 获取世界书数据
-async function getWorldbookData(worldbookName) {
-  try {
-    const response = await fetch("/api/worldinfo/get", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: worldbookName })
-    });
-    
-    if (response.ok) {
-      return await response.json();
-    }
-    
-    console.log("[聊天总结] POST方式获取失败，尝试其他方式");
-  } catch (e) {
-    console.log("[聊天总结] 获取世界书失败:", e.message);
-  }
-  
-  return null;
-}
-
-// 保存世界书条目
+// 操作世界书条目
 async function saveToWorldbook(entryName, content) {
   const settings = getSettings();
+  const worldbookName = settings.selectedWorldbook;
   
-  if (!settings.selectedWorldbook) {
+  if (!worldbookName) {
     toastr.warning("请先选择目标世界书", "聊天总结");
     return false;
   }
   
-  const worldbookName = settings.selectedWorldbook;
-  console.log("[聊天总结] 准备保存到世界书:", worldbookName, "条目:", entryName);
+  console.log("[聊天总结] 保存到世界书:", worldbookName, "条目:", entryName);
   
   try {
-    // 获取世界书数据
-    const worldbook = await getWorldbookData(worldbookName);
-    
-    if (!worldbook) {
-      console.log("[聊天总结] 无法获取世界书数据，尝试直接创建条目");
-      return await createEntryDirectly(worldbookName, entryName, content);
-    }
-    
-    const entries = worldbook.entries || {};
-    let foundUid = null;
-    
-    // 查找已存在的条目
-    for (const [uid, entry] of Object.entries(entries)) {
-      const comment = entry.comment || "";
-      const keys = entry.key || [];
-      if (comment === entryName || keys.includes(entryName)) {
-        foundUid = uid;
-        console.log("[聊天总结] 找到已存在的条目, uid:", uid);
-        break;
+    // 方法1: 使用SillyTavern的全局函数
+    if (typeof window.saveWorldInfo === 'function') {
+      console.log("[聊天总结] 使用全局saveWorldInfo");
+      // 先获取数据
+      const data = await window.getWorldInfo?.(worldbookName);
+      if (data) {
+        // 更新或添加条目
+        // ...
       }
     }
     
-    if (foundUid) {
-      // 更新现有条目
-      entries[foundUid].content = content;
-    } else {
-      // 创建新条目
-      const newUid = Object.keys(entries).length;
-      entries[newUid] = {
-        uid: newUid,
-        key: [entryName],
-        keysecondary: [],
-        comment: entryName,
-        content: content,
-        constant: true,
-        selective: false,
-        selectiveLogic: 0,
-        addMemo: true,
-        order: 100,
-        position: 0,
-        disable: false,
-        excludeRecursion: false,
-        preventRecursion: false,
-        probability: 100,
-        useProbability: true,
-        depth: 4,
-        group: "",
-        scanDepth: null,
-        caseSensitive: null,
-        matchWholeWords: null,
-        automationId: "",
-        role: null,
-        vectorized: false,
-        displayIndex: Object.keys(entries).length,
-      };
-      console.log("[聊天总结] 创建新条目, uid:", newUid);
-    }
-    
-    // 保存到服务器
-    const saveResponse = await fetch("/api/worldinfo/edit", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: worldbookName,
-        data: { entries: entries }
-      })
-    });
-    
-    if (saveResponse.ok) {
-      console.log("[聊天总结] 保存成功 (edit API)");
-      return true;
-    }
-    
-    console.log("[聊天总结] edit API失败，状态:", saveResponse.status);
-    
-    // 尝试其他保存方式
-    return await createEntryDirectly(worldbookName, entryName, content);
-    
-  } catch (e) {
-    console.error("[聊天总结] 保存出错:", e);
-    return await createEntryDirectly(worldbookName, entryName, content);
-  }
-}
-
-// 直接创建/更新条目（备用方法）
-async function createEntryDirectly(worldbookName, entryName, content) {
-  console.log("[聊天总结] 尝试直接创建条目方式");
-  
-  // 方法1: 使用 update-entry API
-  try {
-    const response = await fetch("/api/worldinfo/update-entry", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        file: worldbookName,
-        uid: entryName,
-        key: entryName,
-        comment: entryName,
-        content: content,
-        constant: true
-      })
-    });
-    
-    if (response.ok) {
-      console.log("[聊天总结] update-entry 成功");
-      return true;
-    }
-  } catch (e) {
-    console.log("[聊天总结] update-entry 失败:", e.message);
-  }
-  
-  // 方法2: 使用 create-entry API
-  try {
-    const response = await fetch("/api/worldinfo/create-entry", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        file: worldbookName,
-        key: entryName,
-        comment: entryName,
-        content: content,
-        constant: true
-      })
-    });
-    
-    if (response.ok) {
-      console.log("[聊天总结] create-entry 成功");
-      return true;
-    }
-  } catch (e) {
-    console.log("[聊天总结] create-entry 失败:", e.message);
-  }
-  
-  // 方法3: 使用文件保存API
-  try {
-    const worldbook = await getWorldbookData(worldbookName) || { entries: {} };
-    const entries = worldbook.entries || {};
-    
-    // 添加或更新条目
-    let found = false;
-    for (const uid in entries) {
-      if (entries[uid].comment === entryName || (entries[uid].key && entries[uid].key.includes(entryName))) {
-        entries[uid].content = content;
-        found = true;
-        break;
+    // 方法2: 直接操作world_info对象
+    if (typeof world_info !== 'undefined') {
+      console.log("[聊天总结] 找到全局world_info对象");
+      const entries = world_info?.data?.entries || world_info?.entries;
+      if (entries) {
+        let found = false;
+        for (const uid in entries) {
+          if (entries[uid].comment === entryName || entries[uid].key?.includes(entryName)) {
+            entries[uid].content = content;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          const newUid = Date.now();
+          entries[newUid] = {
+            uid: newUid,
+            key: [entryName],
+            comment: entryName,
+            content: content,
+            constant: true,
+            disable: false,
+            order: 100,
+            position: 0
+          };
+        }
+        
+        // 触发保存事件
+        $(document).trigger('worldInfoUpdated');
+        console.log("[聊天总结] 已更新world_info对象");
       }
     }
     
-    if (!found) {
-      const newUid = Date.now();
-      entries[newUid] = {
-        uid: newUid,
-        key: [entryName],
-        comment: entryName,
-        content: content,
-        constant: true,
-        disable: false,
-        order: 100,
-        position: 0
-      };
-    }
-    
-    // 尝试直接写入文件
-    const response = await fetch("/api/worldinfo/save", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: worldbookName,
-        entries: entries
-      })
-    });
-    
-    if (response.ok) {
-      console.log("[聊天总结] save API 成功");
+    // 方法3: 使用jQuery事件触发酒馆保存
+    const $saveBtn = $('[id*="world_info_save"], .world_info_save');
+    if ($saveBtn.length) {
+      $saveBtn.trigger('click');
+      console.log("[聊天总结] 触发保存按钮");
       return true;
     }
-  } catch (e) {
-    console.log("[聊天总结] save API 失败:", e.message);
-  }
-  
-  // 全部失败，弹出手动复制窗口
-  console.log("[聊天总结] 所有自动保存方式失败，显示手动复制窗口");
-  toastr.warning("自动保存失败，请手动复制", "聊天总结");
-  showCopyPopup(entryName, content);
-  return false;
-}
-
-// 显示复制弹窗
-function showCopyPopup(title, content) {
-  $("#chat_summary_popup_overlay").remove();
-  
-  const popup = `
-    <div id="chat_summary_popup_overlay" style="
-      position: fixed;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0,0,0,0.7);
-      z-index: 99999;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    ">
-      <div style="
-        background: #1e1e2e;
-        border-radius: 12px;
-        width: 90%;
-        max-width: 600px;
-        max-height: 80vh;
-        display: flex;
-        flex-direction: column;
-        box-shadow: 0 10px 40px rgba(0,0,0,0.5);
-      ">
-        <div style="
-          padding: 16px 20px;
-          background: linear-gradient(135deg, #f39c12, #e74c3c);
-          border-radius: 12px 12px 0 0;
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-        ">
-          <span style="font-weight: 600; font-size: 16px;">📋 请手动复制到世界书「${escapeHtml(title)}」条目</span>
-          <button id="chat_summary_popup_close" style="
-            background: rgba(255,255,255,0.2);
-            border: none;
-            color: white;
-            width: 32px;
-            height: 32px;
-            border-radius: 50%;
-            cursor: pointer;
-            font-size: 18px;
-          ">×</button>
-        </div>
-        <div style="
-          padding: 16px;
-          overflow-y: auto;
-          flex: 1;
-          font-size: 14px;
-          line-height: 1.6;
-          white-space: pre-wrap;
-          color: #e0e0e0;
-          user-select: text;
-        ">${escapeHtml(content)}</div>
-        <div style="
-          padding: 16px;
-          display: flex;
-          gap: 12px;
-          border-top: 1px solid rgba(255,255,255,0.1);
-        ">
-          <button id="chat_summary_copy_btn" style="
-            flex: 1;
-            padding: 12px;
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            border: none;
-            border-radius: 8px;
-            color: white;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 600;
-          ">📋 复制内容</button>
-          <button id="chat_summary_popup_cancel" style="
-            flex: 1;
-            padding: 12px;
-            background: #444;
-            border: none;
-            border-radius: 8px;
-            color: white;
-            cursor: pointer;
-            font-size: 14px;
-          ">关闭</button>
-        </div>
-      </div>
-    </div>
-  `;
-  
-  $("body").append(popup);
-  
-  $("#chat_summary_popup_close, #chat_summary_popup_cancel").on("click", function() {
-    $("#chat_summary_popup_overlay").remove();
-  });
-  
-  $("#chat_summary_copy_btn").on("click", function() {
-    navigator.clipboard.writeText(content).then(() => {
-      toastr.success("已复制到剪贴板", "聊天总结");
-    }).catch(() => {
-      toastr.error("复制失败，请手动选择复制", "聊天总结");
+    
+    // 方法4: 使用fetch但加上正确的headers
+    const csrfToken = $('meta[name="csrf-token"]').attr('content') || '';
+    
+    // 先读取现有数据
+    const getResp = await fetch("/getWorldInfo", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrfToken
+      },
+      body: JSON.stringify({ name: worldbookName })
     });
-  });
+    
+    if (getResp.ok) {
+      const worldData = await getResp.json();
+      const entries = worldData.entries || {};
+      
+      // 查找或创建条目
+      let found = false;
+      for (const uid in entries) {
+        if (entries[uid].comment === entryName || entries[uid].key?.includes(entryName)) {
+          entries[uid].content = content;
+          found = true;
+          break;
+        }
+      }
+      
+      if (!found) {
+        const newUid = Object.keys(entries).length;
+        entries[newUid] = {
+          uid: newUid,
+          key: [entryName],
+          comment: entryName,
+          content: content,
+          constant: true,
+          disable: false
+        };
+      }
+      
+      // 保存
+      const saveResp = await fetch("/saveWorldInfo", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrfToken
+        },
+        body: JSON.stringify({
+          name: worldbookName,
+          data: { entries }
+        })
+      });
+      
+      if (saveResp.ok) {
+        console.log("[聊天总结] fetch保存成功");
+        return true;
+      }
+    }
+    
+    console.log("[聊天总结] 所有方法都失败");
+    return false;
+    
+  } catch (e) {
+    console.error("[聊天总结] 保存失败:", e);
+    return false;
+  }
 }
 
-// 从世界书读取条目内容
+// 从世界书读取
 async function readFromWorldbook(entryName) {
   const settings = getSettings();
-  
-  if (!settings.selectedWorldbook) {
-    return null;
-  }
-  
   const worldbookName = settings.selectedWorldbook;
+  
+  if (!worldbookName) return null;
+  
   console.log("[聊天总结] 从世界书读取:", worldbookName, "条目:", entryName);
   
   try {
-    const worldbook = await getWorldbookData(worldbookName);
-    
-    if (!worldbook || !worldbook.entries) {
-      console.log("[聊天总结] 世界书数据为空");
-      return null;
-    }
-    
-    const entries = worldbook.entries;
-    
-    for (const [uid, entry] of Object.entries(entries)) {
-      const comment = entry.comment || "";
-      const keys = entry.key || [];
-      if (comment === entryName || keys.includes(entryName)) {
-        console.log("[聊天总结] 找到条目:", uid, "内容长度:", entry.content?.length);
-        return entry.content;
+    // 方法1: 检查全局world_info
+    if (typeof world_info !== 'undefined') {
+      const entries = world_info?.data?.entries || world_info?.entries;
+      if (entries) {
+        for (const uid in entries) {
+          if (entries[uid].comment === entryName || entries[uid].key?.includes(entryName)) {
+            console.log("[聊天总结] 从全局world_info读取成功");
+            return entries[uid].content;
+          }
+        }
       }
     }
     
-    console.log("[聊天总结] 未找到条目:", entryName);
+    // 方法2: 使用fetch
+    const csrfToken = $('meta[name="csrf-token"]').attr('content') || '';
+    
+    const resp = await fetch("/getWorldInfo", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrfToken
+      },
+      body: JSON.stringify({ name: worldbookName })
+    });
+    
+    if (resp.ok) {
+      const data = await resp.json();
+      const entries = data.entries || {};
+      
+      for (const uid in entries) {
+        if (entries[uid].comment === entryName || entries[uid].key?.includes(entryName)) {
+          console.log("[聊天总结] 从API读取成功");
+          return entries[uid].content;
+        }
+      }
+    }
+    
     return null;
   } catch (e) {
-    console.error("[聊天总结] 读取世界书失败:", e);
+    console.error("[聊天总结] 读取失败:", e);
     return null;
   }
 }
 
-// ============ 楼层选择和内容处理 ============
+// ============ 楼层选择 ============
 
 function parseFloorRange(rangeStr) {
   const parts = rangeStr.split("-");
-  if (parts.length !== 2) {
-    return { start: 0, end: 10 };
-  }
-  const start = parseInt(parts[0].trim()) || 0;
-  const end = parseInt(parts[1].trim()) || 10;
-  return { start, end };
+  if (parts.length !== 2) return { start: 0, end: 10 };
+  return {
+    start: parseInt(parts[0].trim()) || 0,
+    end: parseInt(parts[1].trim()) || 10
+  };
 }
 
 function getSelectedContent() {
@@ -538,23 +392,18 @@ function getSelectedContent() {
     
     let content = msg.mes || "";
     
-    // 排除指定内容
     if (settings.excludePattern && settings.excludePattern.trim()) {
       try {
         const regex = new RegExp(settings.excludePattern, "gi");
         content = content.replace(regex, "");
-      } catch (e) {
-        console.error("[聊天总结] 正则表达式错误:", e);
-      }
+      } catch (e) {}
     }
     
     content = content.trim();
     if (content) {
-      const role = msg.is_user ? "👤 用户" : "🤖 AI";
       messages.push({
         floor: i,
-        role: role,
-        name: msg.name || role,
+        name: msg.name || (msg.is_user ? "用户" : "AI"),
         content: content
       });
     }
@@ -567,112 +416,62 @@ function getSelectedContent() {
   return { content: formattedContent, messages };
 }
 
-// ============ 弹窗预览 ============
+// ============ 弹窗 ============
 
 function showPreviewPopup(content, onConfirm) {
   $("#chat_summary_popup_overlay").remove();
   
-  const popup = `
-    <div id="chat_summary_popup_overlay" style="
-      position: fixed;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0,0,0,0.7);
-      z-index: 99999;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    ">
-      <div style="
-        background: #1e1e2e;
-        border-radius: 12px;
-        width: 90%;
-        max-width: 600px;
-        max-height: 80vh;
-        display: flex;
-        flex-direction: column;
-        box-shadow: 0 10px 40px rgba(0,0,0,0.5);
-      ">
-        <div style="
-          padding: 16px 20px;
-          background: linear-gradient(135deg, #667eea, #764ba2);
-          border-radius: 12px 12px 0 0;
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-        ">
-          <span style="font-weight: 600; font-size: 16px;">📄 待总结内容预览</span>
-          <button id="chat_summary_popup_close" style="
-            background: rgba(255,255,255,0.2);
-            border: none;
-            color: white;
-            width: 32px;
-            height: 32px;
-            border-radius: 50%;
-            cursor: pointer;
-            font-size: 18px;
-          ">×</button>
+  $("body").append(`
+    <div id="chat_summary_popup_overlay" style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:99999;display:flex;align-items:center;justify-content:center;">
+      <div style="background:#1e1e2e;border-radius:12px;width:90%;max-width:600px;max-height:80vh;display:flex;flex-direction:column;">
+        <div style="padding:16px 20px;background:linear-gradient(135deg,#667eea,#764ba2);border-radius:12px 12px 0 0;display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-weight:600;">📄 待总结内容预览</span>
+          <button id="chat_summary_popup_close" style="background:rgba(255,255,255,0.2);border:none;color:white;width:32px;height:32px;border-radius:50%;cursor:pointer;">×</button>
         </div>
-        <div style="
-          padding: 16px;
-          overflow-y: auto;
-          flex: 1;
-          font-size: 14px;
-          line-height: 1.6;
-          white-space: pre-wrap;
-          color: #e0e0e0;
-        ">${escapeHtml(content) || "没有选中任何内容"}</div>
-        <div style="
-          padding: 16px;
-          display: flex;
-          gap: 12px;
-          border-top: 1px solid rgba(255,255,255,0.1);
-        ">
-          <button id="chat_summary_popup_cancel" style="
-            flex: 1;
-            padding: 12px;
-            background: #444;
-            border: none;
-            border-radius: 8px;
-            color: white;
-            cursor: pointer;
-            font-size: 14px;
-          ">取消</button>
-          <button id="chat_summary_popup_confirm" style="
-            flex: 1;
-            padding: 12px;
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            border: none;
-            border-radius: 8px;
-            color: white;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 600;
-          ">✨ 开始总结</button>
+        <div style="padding:16px;overflow-y:auto;flex:1;font-size:14px;line-height:1.6;white-space:pre-wrap;color:#e0e0e0;">${escapeHtml(content)}</div>
+        <div style="padding:16px;display:flex;gap:12px;border-top:1px solid rgba(255,255,255,0.1);">
+          <button id="chat_summary_popup_cancel" style="flex:1;padding:12px;background:#444;border:none;border-radius:8px;color:white;cursor:pointer;">取消</button>
+          <button id="chat_summary_popup_confirm" style="flex:1;padding:12px;background:linear-gradient(135deg,#667eea,#764ba2);border:none;border-radius:8px;color:white;cursor:pointer;font-weight:600;">✨ 开始总结</button>
         </div>
       </div>
     </div>
-  `;
+  `);
   
-  $("body").append(popup);
-  
-  $("#chat_summary_popup_close, #chat_summary_popup_cancel").on("click", function() {
-    $("#chat_summary_popup_overlay").remove();
-  });
-  
-  $("#chat_summary_popup_confirm").on("click", function() {
+  $("#chat_summary_popup_close, #chat_summary_popup_cancel").on("click", () => $("#chat_summary_popup_overlay").remove());
+  $("#chat_summary_popup_confirm").on("click", () => {
     $("#chat_summary_popup_overlay").remove();
     if (onConfirm) onConfirm();
   });
 }
 
+function showResultPopup(title, content) {
+  $("#chat_summary_popup_overlay").remove();
+  
+  $("body").append(`
+    <div id="chat_summary_popup_overlay" style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:99999;display:flex;align-items:center;justify-content:center;">
+      <div style="background:#1e1e2e;border-radius:12px;width:90%;max-width:600px;max-height:80vh;display:flex;flex-direction:column;">
+        <div style="padding:16px 20px;background:linear-gradient(135deg,#27ae60,#2ecc71);border-radius:12px 12px 0 0;display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-weight:600;">✅ ${escapeHtml(title)}</span>
+          <button id="chat_summary_popup_close" style="background:rgba(255,255,255,0.2);border:none;color:white;width:32px;height:32px;border-radius:50%;cursor:pointer;">×</button>
+        </div>
+        <div style="padding:16px;overflow-y:auto;flex:1;font-size:14px;line-height:1.6;white-space:pre-wrap;color:#e0e0e0;user-select:text;">${escapeHtml(content)}</div>
+        <div style="padding:16px;display:flex;gap:12px;border-top:1px solid rgba(255,255,255,0.1);">
+          <button id="chat_summary_copy_btn" style="flex:1;padding:12px;background:linear-gradient(135deg,#667eea,#764ba2);border:none;border-radius:8px;color:white;cursor:pointer;font-weight:600;">📋 复制</button>
+          <button id="chat_summary_popup_cancel" style="flex:1;padding:12px;background:#444;border:none;border-radius:8px;color:white;cursor:pointer;">关闭</button>
+        </div>
+      </div>
+    </div>
+  `);
+  
+  $("#chat_summary_popup_close, #chat_summary_popup_cancel").on("click", () => $("#chat_summary_popup_overlay").remove());
+  $("#chat_summary_copy_btn").on("click", () => {
+    navigator.clipboard.writeText(content).then(() => toastr.success("已复制", "聊天总结"));
+  });
+}
+
 function escapeHtml(text) {
   if (!text) return "";
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 // ============ 核心功能 ============
@@ -685,26 +484,11 @@ function previewSmallSummary() {
     return;
   }
   
-  showPreviewPopup(content, async () => {
-    await generateSmallSummary(content);
-  });
+  showPreviewPopup(content, () => generateSmallSummary(content));
 }
 
 async function generateSmallSummary(content) {
-  if (isProcessing) {
-    toastr.warning("正在处理中...", "聊天总结");
-    return;
-  }
-  
-  if (!content) {
-    const { content: c } = getSelectedContent();
-    content = c;
-  }
-  
-  if (!content) {
-    toastr.warning("没有内容可总结", "聊天总结");
-    return;
-  }
+  if (isProcessing) return;
   
   const settings = getSettings();
   
@@ -721,37 +505,30 @@ async function generateSmallSummary(content) {
     const summary = await callAI(prompt);
     
     if (summary && summary.trim()) {
-      // 读取现有小总结
-      let existingSummaries = await readFromWorldbook(settings.smallSummaryEntryName) || "";
-      
-      // 添加新总结
+      let existing = await readFromWorldbook(settings.smallSummaryEntryName) || "";
       const timestamp = new Date().toLocaleString("zh-CN");
-      const newEntry = existingSummaries 
-        ? `${existingSummaries}\n\n---\n\n【${timestamp}】\n${summary.trim()}`
+      const newContent = existing 
+        ? `${existing}\n\n---\n\n【${timestamp}】\n${summary.trim()}`
         : `【${timestamp}】\n${summary.trim()}`;
       
-      // 保存到世界书
-      const saved = await saveToWorldbook(settings.smallSummaryEntryName, newEntry);
+      const saved = await saveToWorldbook(settings.smallSummaryEntryName, newContent);
       
       if (saved) {
-        toastr.success("小总结已生成并保存到世界书", "聊天总结");
+        toastr.success("小总结已保存到世界书", "聊天总结");
       }
-    } else {
-      toastr.warning("AI返回内容为空", "聊天总结");
+      
+      showResultPopup("小总结生成完成", summary.trim());
     }
   } catch (e) {
     toastr.error("生成失败: " + e.message, "聊天总结");
-    console.error("[聊天总结] 生成小总结失败:", e);
+    console.error("[聊天总结]", e);
   } finally {
     isProcessing = false;
   }
 }
 
 async function generateBigSummary() {
-  if (isProcessing) {
-    toastr.warning("正在处理中...", "聊天总结");
-    return;
-  }
+  if (isProcessing) return;
   
   const settings = getSettings();
   
@@ -760,15 +537,13 @@ async function generateBigSummary() {
     return;
   }
   
-  // 从世界书读取小总结
   const smallSummaries = await readFromWorldbook(settings.smallSummaryEntryName);
   
   if (!smallSummaries) {
-    toastr.warning("世界书中没有找到小总结内容，请先生成小总结", "聊天总结");
+    toastr.warning("没有找到小总结，请先生成", "聊天总结");
     return;
   }
   
-  // 显示预览
   showPreviewPopup(smallSummaries, async () => {
     isProcessing = true;
     toastr.info("正在生成大总结...", "聊天总结");
@@ -781,14 +556,13 @@ async function generateBigSummary() {
         const saved = await saveToWorldbook(settings.bigSummaryEntryName, result.trim());
         
         if (saved) {
-          toastr.success("大总结已生成并保存到世界书", "聊天总结");
+          toastr.success("大总结已保存到世界书", "聊天总结");
         }
-      } else {
-        toastr.warning("AI返回内容为空", "聊天总结");
+        
+        showResultPopup("大总结生成完成", result.trim());
       }
     } catch (e) {
       toastr.error("生成失败: " + e.message, "聊天总结");
-      console.error("[聊天总结] 生成大总结失败:", e);
     } finally {
       isProcessing = false;
     }
@@ -802,15 +576,25 @@ function updateUI() {
   if (!settings) return;
   
   $("#chat_summary_enabled").prop("checked", settings.enabled);
+  $("#chat_summary_use_custom_api").prop("checked", settings.useCustomApi);
+  $("#chat_summary_api_url").val(settings.apiUrl);
+  $("#chat_summary_api_key").val(settings.apiKey);
+  $("#chat_summary_api_model").val(settings.apiModel);
   $("#chat_summary_floor_range").val(settings.floorRange);
   $("#chat_summary_exclude").val(settings.excludePattern);
   $("#chat_summary_small_entry").val(settings.smallSummaryEntryName);
   $("#chat_summary_big_entry").val(settings.bigSummaryEntryName);
+  
+  if (settings.useCustomApi) {
+    $("#chat_summary_api_settings").show();
+  } else {
+    $("#chat_summary_api_settings").hide();
+  }
 }
 
 function createUI() {
   const html = `
-  <div id="chat_summary_panel" class="chat-summary-panel">
+  <div id="chat_summary_panel">
     <div class="inline-drawer">
       <div class="inline-drawer-toggle inline-drawer-header">
         <b>📝 聊天总结助手</b>
@@ -818,71 +602,88 @@ function createUI() {
       </div>
       <div class="inline-drawer-content">
         
-        <!-- 基本开关 -->
         <div class="chat-summary-section">
-          <div class="chat-summary-row">
+          <label class="checkbox_label">
+            <input type="checkbox" id="chat_summary_enabled" checked>
+            <span>启用扩展</span>
+          </label>
+        </div>
+        
+        <hr>
+        
+        <div class="chat-summary-section">
+          <b>🔌 API设置</b>
+          <div style="margin-top:8px;">
             <label class="checkbox_label">
-              <input type="checkbox" id="chat_summary_enabled" checked>
-              <span>启用扩展</span>
+              <input type="checkbox" id="chat_summary_use_custom_api">
+              <span>使用独立API</span>
             </label>
+          </div>
+          <div id="chat_summary_api_settings" style="display:none;margin-top:10px;">
+            <div style="margin-bottom:8px;">
+              <label>API地址</label>
+              <input type="text" id="chat_summary_api_url" class="text_pole" placeholder="http://127.0.0.1:8888">
+            </div>
+            <div style="margin-bottom:8px;">
+              <label>API密钥</label>
+              <input type="password" id="chat_summary_api_key" class="text_pole" placeholder="sk-xxx">
+            </div>
+            <div style="margin-bottom:8px;">
+              <label>模型名称</label>
+              <input type="text" id="chat_summary_api_model" class="text_pole" placeholder="gpt-3.5-turbo">
+            </div>
           </div>
         </div>
         
-        <!-- 世界书设置 -->
+        <hr>
+        
         <div class="chat-summary-section">
-          <div class="chat-summary-section-title">📖 世界书设置</div>
-          <div class="chat-summary-row">
+          <b>📖 世界书设置</b>
+          <div style="margin-top:8px;">
             <label>目标世界书</label>
             <select id="chat_summary_worldbook" class="text_pole">
-              <option value="">-- 选择世界书 --</option>
+              <option value="">-- 选择 --</option>
             </select>
+            <div class="menu_button" id="chat_summary_refresh_wb" style="margin-top:5px;">🔄 刷新</div>
           </div>
-          <div class="chat-summary-row">
-            <div class="menu_button" id="chat_summary_refresh_wb">🔄 刷新列表</div>
-          </div>
-          <div class="chat-summary-row">
+          <div style="margin-top:8px;">
             <label>小总结条目名</label>
             <input type="text" id="chat_summary_small_entry" class="text_pole" value="小总结">
           </div>
-          <div class="chat-summary-row">
+          <div style="margin-top:8px;">
             <label>大总结条目名</label>
             <input type="text" id="chat_summary_big_entry" class="text_pole" value="大总结">
           </div>
         </div>
         
-        <!-- 小总结设置 -->
+        <hr>
+        
         <div class="chat-summary-section">
-          <div class="chat-summary-section-title">📌 小总结设置</div>
-          <div class="chat-summary-row">
-            <label>选择楼层范围</label>
-            <input type="text" id="chat_summary_floor_range" class="text_pole" placeholder="0-10" value="0-10">
+          <b>📌 小总结</b>
+          <div style="margin-top:8px;">
+            <label>楼层范围</label>
+            <input type="text" id="chat_summary_floor_range" class="text_pole" value="0-10" placeholder="0-10">
           </div>
-          <div class="chat-summary-row">
+          <div style="margin-top:8px;">
             <label>排除内容(正则)</label>
             <input type="text" id="chat_summary_exclude" class="text_pole" placeholder="<thinking>[\\s\\S]*?</thinking>">
           </div>
-          <div class="chat-summary-row">
-            <div class="menu_button" id="chat_summary_gen_small">✨ 生成小总结</div>
-          </div>
+          <div class="menu_button" id="chat_summary_gen_small" style="margin-top:10px;">✨ 生成小总结</div>
         </div>
         
-        <!-- 大总结 -->
+        <hr>
+        
         <div class="chat-summary-section">
-          <div class="chat-summary-section-title">📚 大总结</div>
-          <div class="chat-summary-row">
-            <div class="menu_button" id="chat_summary_gen_big">📚 生成大总结</div>
-          </div>
-          <p style="font-size: 12px; opacity: 0.7; margin-top: 5px;">从世界书的小总结条目读取内容进行合并</p>
+          <b>📚 大总结</b>
+          <div class="menu_button" id="chat_summary_gen_big" style="margin-top:8px;">📚 生成大总结</div>
+          <p style="font-size:11px;opacity:0.6;margin-top:5px;">从世界书小总结条目合并生成</p>
         </div>
-        
-        <p style="font-size: 11px; opacity: 0.5; margin-top: 10px;">使用酒馆已连接的API生成总结</p>
         
       </div>
     </div>
   </div>`;
   
   $("#extensions_settings").append(html);
-  console.log("[聊天总结助手] UI已创建");
 }
 
 function bindEvents() {
@@ -893,22 +694,30 @@ function bindEvents() {
     saveSettings();
   });
   
-  // 小总结设置
-  $("#chat_summary_floor_range").on("change", function() {
-    settings.floorRange = $(this).val() || "0-10";
+  $("#chat_summary_use_custom_api").on("change", function() {
+    settings.useCustomApi = $(this).prop("checked");
+    saveSettings();
+    updateUI();
+  });
+  
+  $("#chat_summary_api_url").on("change", function() {
+    settings.apiUrl = $(this).val().trim();
     saveSettings();
   });
   
-  $("#chat_summary_exclude").on("change", function() {
-    settings.excludePattern = $(this).val();
+  $("#chat_summary_api_key").on("change", function() {
+    settings.apiKey = $(this).val().trim();
     saveSettings();
   });
   
-  // 世界书设置
+  $("#chat_summary_api_model").on("change", function() {
+    settings.apiModel = $(this).val().trim();
+    saveSettings();
+  });
+  
   $("#chat_summary_worldbook").on("change", function() {
     settings.selectedWorldbook = $(this).val();
     saveSettings();
-    console.log("[聊天总结] 选择世界书:", settings.selectedWorldbook);
   });
   
   $("#chat_summary_refresh_wb").on("click", updateWorldbookSelect);
@@ -923,25 +732,26 @@ function bindEvents() {
     saveSettings();
   });
   
-  // 操作按钮
+  $("#chat_summary_floor_range").on("change", function() {
+    settings.floorRange = $(this).val() || "0-10";
+    saveSettings();
+  });
+  
+  $("#chat_summary_exclude").on("change", function() {
+    settings.excludePattern = $(this).val();
+    saveSettings();
+  });
+  
   $("#chat_summary_gen_small").on("click", previewSmallSummary);
   $("#chat_summary_gen_big").on("click", generateBigSummary);
-  
-  console.log("[聊天总结助手] 事件已绑定");
 }
 
 // 初始化
 jQuery(async () => {
-  console.log("[聊天总结助手] 开始加载...");
-  
+  console.log("[聊天总结助手] 加载中...");
   createUI();
   loadSettings();
   bindEvents();
-  
-  // 延迟初始化世界书列表
-  setTimeout(async () => {
-    await updateWorldbookSelect();
-  }, 2000);
-  
-  console.log("[聊天总结助手] 扩展已加载完成");
+  setTimeout(updateWorldbookSelect, 2000);
+  console.log("[聊天总结助手] 加载完成");
 });
