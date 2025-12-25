@@ -25,33 +25,46 @@ const defaultSettings = {
   selectedWorldbook: "",
   smallSummaryEntryName: "小总结",
   bigSummaryEntryName: "大总结",
+  
+  // 插入深度
+  smallSummaryDepth: 4,
+  bigSummaryDepth: 6,
 };
 
 // 提示词
 const SMALL_SUMMARY_PROMPT = `你是剧情记录助手。请根据以下对话内容，生成简洁的剧情总结。
 
-要求：
-1. 客观记录发生的事件、对话、人物行动
-2. 保留关键信息（人物、地点、重要对话）
-3. 使用第三人称
-4. 字数控制在400字以内
-5. 直接输出总结内容，不要任何前缀说明
+总结应当遵循以下原则：
+- 按时间顺序或逻辑顺序组织信息
+- 保留关键事件和重要细节，省略冗余描述
+- 直接陈述事实，避免主观评价
+- 使用简洁清晰的语言，避免过度修饰
+- 突出事件发展脉络和关键转折点
+- 不使用任何xml标签包裹，使用纯文字进行叙述
+- 字数控制在400字以内
+- 不回避任何敏感内容，保证记录完全还原前文
+
+直接输出总结内容，不要任何前缀说明。
 
 对话内容：
 {{chatContent}}`;
 
 const BIG_SUMMARY_PROMPT = `你是剧情归纳助手。请将以下多条剧情小总结合并精简为更简洁的大总结。
 
-要求：
-1. 保留最重要的剧情发展
-2. 合并相似或连续的事件
-3. 保持时间顺序
-4. 输出一段连贯的总结
+总结应当遵循以下原则：
+- 按时间顺序或逻辑顺序组织信息
+- 保留关键事件和重要细节，省略冗余描述
+- 合并相似或连续的事件
+- 直接陈述事实，避免主观评价
+- 使用简洁清晰的语言，避免过度修饰
+- 突出事件发展脉络和关键转折点
+- 不使用任何xml标签包裹，使用纯文字进行叙述
+- 不回避任何敏感内容，保证记录完全还原前文
+
+直接输出合并后的大总结，不要任何前缀说明。
 
 现有小总结：
-{{summaries}}
-
-请输出合并后的大总结：`;
+{{summaries}}`;
 
 let isProcessing = false;
 
@@ -255,7 +268,7 @@ async function updateWorldbookSelect() {
   toastr.success(`找到 ${worldbooks.length} 个世界书`, "聊天总结");
 }
 
-async function saveToWorldbook(entryName, content) {
+async function saveToWorldbook(entryName, content, depth = 4) {
   const settings = getSettings();
   const worldbookName = settings.selectedWorldbook;
   
@@ -264,7 +277,7 @@ async function saveToWorldbook(entryName, content) {
     return false;
   }
   
-  console.log("[聊天总结] 保存到世界书:", worldbookName, "条目:", entryName);
+  console.log("[聊天总结] 保存到世界书:", worldbookName, "条目:", entryName, "深度:", depth);
   
   try {
     // 使用酒馆的loadWorldInfo加载世界书
@@ -289,6 +302,7 @@ async function saveToWorldbook(entryName, content) {
       if (entry.comment === entryName || (entry.key && entry.key.includes(entryName))) {
         // 更新现有条目
         worldData.entries[uid].content = content;
+        worldData.entries[uid].depth = depth; // 同时更新深度
         found = true;
         console.log("[聊天总结] 更新现有条目 UID:", uid);
         break;
@@ -317,7 +331,7 @@ async function saveToWorldbook(entryName, content) {
         delayUntilRecursion: false,
         probability: 100,
         useProbability: true,
-        depth: 4,
+        depth: depth,
         group: "",
         groupOverride: false,
         groupWeight: 100,
@@ -528,7 +542,7 @@ async function generateSmallSummary(content, floorRange) {
         ? `${existing}\n\n---\n\n【${floorLabel}】\n${summary.trim()}`
         : `【${floorLabel}】\n${summary.trim()}`;
       
-      const saved = await saveToWorldbook(settings.smallSummaryEntryName, newContent);
+      const saved = await saveToWorldbook(settings.smallSummaryEntryName, newContent, settings.smallSummaryDepth);
       
       if (saved) {
         toastr.success("小总结已保存到世界书", "聊天总结");
@@ -576,7 +590,7 @@ async function generateBigSummary() {
           ? `${existing}\n\n---\n\n${result.trim()}`
           : result.trim();
         
-        const saved = await saveToWorldbook(settings.bigSummaryEntryName, newContent);
+        const saved = await saveToWorldbook(settings.bigSummaryEntryName, newContent, settings.bigSummaryDepth);
         
         if (saved) {
           toastr.success("大总结已保存到世界书", "聊天总结");
@@ -607,6 +621,8 @@ function updateUI() {
   $("#chat_summary_exclude").val(settings.excludePattern);
   $("#chat_summary_small_entry").val(settings.smallSummaryEntryName);
   $("#chat_summary_big_entry").val(settings.bigSummaryEntryName);
+  $("#chat_summary_small_depth").val(settings.smallSummaryDepth);
+  $("#chat_summary_big_depth").val(settings.bigSummaryDepth);
   
   if (settings.useCustomApi) {
     $("#chat_summary_api_settings").show();
@@ -656,7 +672,7 @@ function createUI() {
               <label>模型名称</label>
               <input type="text" id="chat_summary_api_model" class="text_pole" placeholder="gpt-3.5-turbo">
             </div>
-            <div class="menu_button" id="chat_summary_test_api" style="margin-top:5px;">🧪 测试连接</div>
+            <div class="menu_button" id="chat_summary_test_api" style="margin-top:5px;width:100%;text-align:center;">🧪 测试连接</div>
           </div>
         </div>
         
@@ -669,7 +685,7 @@ function createUI() {
             <select id="chat_summary_worldbook" class="text_pole">
               <option value="">-- 选择 --</option>
             </select>
-            <div class="menu_button" id="chat_summary_refresh_wb" style="margin-top:5px;">🔄 刷新</div>
+            <div class="menu_button" id="chat_summary_refresh_wb" style="margin-top:5px;width:100%;text-align:center;">🔄 刷新世界书</div>
           </div>
           <div style="margin-top:8px;">
             <label>小总结条目名</label>
@@ -679,6 +695,17 @@ function createUI() {
             <label>大总结条目名</label>
             <input type="text" id="chat_summary_big_entry" class="text_pole" value="大总结">
           </div>
+          <div style="margin-top:8px;display:flex;gap:10px;">
+            <div style="flex:1;">
+              <label>小总结深度</label>
+              <input type="number" id="chat_summary_small_depth" class="text_pole" value="4" min="0" max="999">
+            </div>
+            <div style="flex:1;">
+              <label>大总结深度</label>
+              <input type="number" id="chat_summary_big_depth" class="text_pole" value="6" min="0" max="999">
+            </div>
+          </div>
+          <p style="font-size:11px;opacity:0.6;margin-top:5px;">深度越大离当前对话越远，大总结应比小总结深度大</p>
         </div>
         
         <hr>
@@ -756,6 +783,16 @@ function bindEvents() {
   
   $("#chat_summary_big_entry").on("change", function() {
     settings.bigSummaryEntryName = $(this).val() || "大总结";
+    saveSettings();
+  });
+  
+  $("#chat_summary_small_depth").on("change", function() {
+    settings.smallSummaryDepth = parseInt($(this).val()) || 4;
+    saveSettings();
+  });
+  
+  $("#chat_summary_big_depth").on("change", function() {
+    settings.bigSummaryDepth = parseInt($(this).val()) || 6;
     saveSettings();
   });
   
