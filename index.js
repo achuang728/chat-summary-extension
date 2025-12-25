@@ -77,14 +77,6 @@ function getSettings() {
 // ============ API调用 ============
 
 async function callAI(prompt) {
-  const settings = getSettings();
-  
-  if (settings.useCustomApi && settings.apiUrl && settings.apiKey && settings.apiModel) {
-    // 暂时禁用自定义API，因为CORS问题
-    console.log("[聊天总结] 自定义API因CORS问题暂不可用，使用酒馆API");
-  }
-  
-  // 使用酒馆的API
   const context = getContext();
   return await context.generateQuietPrompt(prompt, false, false);
 }
@@ -94,37 +86,22 @@ async function callAI(prompt) {
 async function getWorldbooks() {
   const worldbookList = [];
   
-  // 方法1: 从世界书管理器的DOM获取
+  // 从世界书下拉框获取
   try {
-    $("#world_info option").each(function() {
+    $("#world_info option, #world_editor_select option").each(function() {
       const val = $(this).val();
       const text = $(this).text().trim();
-      if (val && text && val !== "" && text !== "None" && text !== "无") {
+      if (val && text && val !== "" && text !== "None" && text !== "无" && !text.includes("选择")) {
         if (!worldbookList.find(w => w.name === val)) {
           worldbookList.push({ name: val, displayName: text });
         }
       }
     });
   } catch (e) {
-    console.log("[聊天总结] DOM方法1失败:", e.message);
+    console.log("[聊天总结] DOM获取失败:", e.message);
   }
   
-  // 方法2: 从世界书编辑器获取
-  try {
-    $("#world_editor_select option").each(function() {
-      const val = $(this).val();
-      const text = $(this).text().trim();
-      if (val && text && val !== "" && text !== "None" && text !== "无" && text !== "--- 选择世界信息 ---") {
-        if (!worldbookList.find(w => w.name === val)) {
-          worldbookList.push({ name: val, displayName: text });
-        }
-      }
-    });
-  } catch (e) {
-    console.log("[聊天总结] DOM方法2失败:", e.message);
-  }
-  
-  // 方法3: 从角色的世界书获取
+  // 从角色世界书获取
   try {
     const context = getContext();
     if (context.characters && context.characterId !== undefined) {
@@ -138,28 +115,6 @@ async function getWorldbooks() {
     }
   } catch (e) {
     console.log("[聊天总结] 角色世界书获取失败:", e.message);
-  }
-  
-  // 方法4: 尝试API
-  try {
-    const response = await fetch("/api/worldinfo/getnames", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({})
-    });
-    if (response.ok) {
-      const names = await response.json();
-      if (Array.isArray(names)) {
-        names.forEach(name => {
-          if (name && !worldbookList.find(w => w.name === name)) {
-            const displayName = name.replace(/\.json$/i, "");
-            worldbookList.push({ name: name, displayName: displayName });
-          }
-        });
-      }
-    }
-  } catch (e) {
-    console.log("[聊天总结] API方法失败:", e.message);
   }
   
   console.log("[聊天总结] 找到世界书:", worldbookList);
@@ -193,7 +148,28 @@ async function updateWorldbookSelect() {
   toastr.success(`找到 ${worldbooks.length} 个世界书`, "聊天总结");
 }
 
-// 保存到世界书 - 使用正确的API
+// 获取世界书数据
+async function getWorldbookData(worldbookName) {
+  try {
+    const response = await fetch("/api/worldinfo/get", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: worldbookName })
+    });
+    
+    if (response.ok) {
+      return await response.json();
+    }
+    
+    console.log("[聊天总结] POST方式获取失败，尝试其他方式");
+  } catch (e) {
+    console.log("[聊天总结] 获取世界书失败:", e.message);
+  }
+  
+  return null;
+}
+
+// 保存世界书条目
 async function saveToWorldbook(entryName, content) {
   const settings = getSettings();
   
@@ -203,40 +179,39 @@ async function saveToWorldbook(entryName, content) {
   }
   
   const worldbookName = settings.selectedWorldbook;
-  console.log("[聊天总结] 保存到世界书:", worldbookName, "条目:", entryName);
+  console.log("[聊天总结] 准备保存到世界书:", worldbookName, "条目:", entryName);
   
   try {
-    // 获取世界书内容
-    const getResponse = await fetch("/api/worldinfo/get", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: worldbookName })
-    });
+    // 获取世界书数据
+    const worldbook = await getWorldbookData(worldbookName);
     
-    if (!getResponse.ok) {
-      console.log("[聊天总结] GET方法失败，尝试其他方式");
-      // 尝试直接创建/更新条目
-      return await saveEntryDirect(worldbookName, entryName, content);
+    if (!worldbook) {
+      console.log("[聊天总结] 无法获取世界书数据，尝试直接创建条目");
+      return await createEntryDirectly(worldbookName, entryName, content);
     }
     
-    const worldbook = await getResponse.json();
     const entries = worldbook.entries || {};
+    let foundUid = null;
     
-    // 查找现有条目
-    let targetUid = null;
+    // 查找已存在的条目
     for (const [uid, entry] of Object.entries(entries)) {
-      if (entry.comment === entryName || (entry.key && entry.key.includes(entryName))) {
-        targetUid = uid;
-        entries[uid].content = content;
+      const comment = entry.comment || "";
+      const keys = entry.key || [];
+      if (comment === entryName || keys.includes(entryName)) {
+        foundUid = uid;
+        console.log("[聊天总结] 找到已存在的条目, uid:", uid);
         break;
       }
     }
     
-    // 如果没找到，创建新条目
-    if (!targetUid) {
-      targetUid = Date.now().toString();
-      entries[targetUid] = {
-        uid: parseInt(targetUid),
+    if (foundUid) {
+      // 更新现有条目
+      entries[foundUid].content = content;
+    } else {
+      // 创建新条目
+      const newUid = Object.keys(entries).length;
+      entries[newUid] = {
+        uid: newUid,
         key: [entryName],
         keysecondary: [],
         comment: entryName,
@@ -260,11 +235,12 @@ async function saveToWorldbook(entryName, content) {
         automationId: "",
         role: null,
         vectorized: false,
-        displayIndex: 0,
+        displayIndex: Object.keys(entries).length,
       };
+      console.log("[聊天总结] 创建新条目, uid:", newUid);
     }
     
-    // 保存世界书
+    // 保存到服务器
     const saveResponse = await fetch("/api/worldinfo/edit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -275,37 +251,59 @@ async function saveToWorldbook(entryName, content) {
     });
     
     if (saveResponse.ok) {
-      console.log("[聊天总结] 保存成功");
+      console.log("[聊天总结] 保存成功 (edit API)");
       return true;
-    } else {
-      console.log("[聊天总结] 保存失败，状态:", saveResponse.status);
-      return await saveEntryDirect(worldbookName, entryName, content);
     }
+    
+    console.log("[聊天总结] edit API失败，状态:", saveResponse.status);
+    
+    // 尝试其他保存方式
+    return await createEntryDirectly(worldbookName, entryName, content);
     
   } catch (e) {
     console.error("[聊天总结] 保存出错:", e);
-    return await saveEntryDirect(worldbookName, entryName, content);
+    return await createEntryDirectly(worldbookName, entryName, content);
   }
 }
 
-// 备用保存方法 - 直接操作条目
-async function saveEntryDirect(worldbookName, entryName, content) {
-  console.log("[聊天总结] 尝试直接保存条目");
+// 直接创建/更新条目（备用方法）
+async function createEntryDirectly(worldbookName, entryName, content) {
+  console.log("[聊天总结] 尝试直接创建条目方式");
   
+  // 方法1: 使用 update-entry API
   try {
-    // 尝试使用 create-entry API
+    const response = await fetch("/api/worldinfo/update-entry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        file: worldbookName,
+        uid: entryName,
+        key: entryName,
+        comment: entryName,
+        content: content,
+        constant: true
+      })
+    });
+    
+    if (response.ok) {
+      console.log("[聊天总结] update-entry 成功");
+      return true;
+    }
+  } catch (e) {
+    console.log("[聊天总结] update-entry 失败:", e.message);
+  }
+  
+  // 方法2: 使用 create-entry API
+  try {
     const response = await fetch("/api/worldinfo/create-entry", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        name: worldbookName,
-        entry: {
-          key: [entryName],
-          comment: entryName,
-          content: content,
-          constant: true,
-          disable: false
-        }
+        file: worldbookName,
+        key: entryName,
+        comment: entryName,
+        content: content,
+        constant: true
       })
     });
     
@@ -317,8 +315,56 @@ async function saveEntryDirect(worldbookName, entryName, content) {
     console.log("[聊天总结] create-entry 失败:", e.message);
   }
   
-  // 最后尝试：显示内容让用户手动复制
-  toastr.warning("自动保存失败，请手动复制内容到世界书", "聊天总结");
+  // 方法3: 使用文件保存API
+  try {
+    const worldbook = await getWorldbookData(worldbookName) || { entries: {} };
+    const entries = worldbook.entries || {};
+    
+    // 添加或更新条目
+    let found = false;
+    for (const uid in entries) {
+      if (entries[uid].comment === entryName || (entries[uid].key && entries[uid].key.includes(entryName))) {
+        entries[uid].content = content;
+        found = true;
+        break;
+      }
+    }
+    
+    if (!found) {
+      const newUid = Date.now();
+      entries[newUid] = {
+        uid: newUid,
+        key: [entryName],
+        comment: entryName,
+        content: content,
+        constant: true,
+        disable: false,
+        order: 100,
+        position: 0
+      };
+    }
+    
+    // 尝试直接写入文件
+    const response = await fetch("/api/worldinfo/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: worldbookName,
+        entries: entries
+      })
+    });
+    
+    if (response.ok) {
+      console.log("[聊天总结] save API 成功");
+      return true;
+    }
+  } catch (e) {
+    console.log("[聊天总结] save API 失败:", e.message);
+  }
+  
+  // 全部失败，弹出手动复制窗口
+  console.log("[聊天总结] 所有自动保存方式失败，显示手动复制窗口");
+  toastr.warning("自动保存失败，请手动复制", "聊天总结");
   showCopyPopup(entryName, content);
   return false;
 }
@@ -355,7 +401,7 @@ function showCopyPopup(title, content) {
           justify-content: space-between;
           align-items: center;
         ">
-          <span style="font-weight: 600; font-size: 16px;">📋 请手动复制到世界书「${title}」条目</span>
+          <span style="font-weight: 600; font-size: 16px;">📋 请手动复制到世界书「${escapeHtml(title)}」条目</span>
           <button id="chat_summary_popup_close" style="
             background: rgba(255,255,255,0.2);
             border: none;
@@ -424,7 +470,7 @@ function showCopyPopup(title, content) {
   });
 }
 
-// 从世界书读取
+// 从世界书读取条目内容
 async function readFromWorldbook(entryName) {
   const settings = getSettings();
   
@@ -433,25 +479,28 @@ async function readFromWorldbook(entryName) {
   }
   
   const worldbookName = settings.selectedWorldbook;
+  console.log("[聊天总结] 从世界书读取:", worldbookName, "条目:", entryName);
   
   try {
-    const response = await fetch("/api/worldinfo/get", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: worldbookName })
-    });
+    const worldbook = await getWorldbookData(worldbookName);
     
-    if (!response.ok) return null;
+    if (!worldbook || !worldbook.entries) {
+      console.log("[聊天总结] 世界书数据为空");
+      return null;
+    }
     
-    const worldbook = await response.json();
-    const entries = worldbook.entries || {};
+    const entries = worldbook.entries;
     
     for (const [uid, entry] of Object.entries(entries)) {
-      if (entry.comment === entryName || (entry.key && entry.key.includes(entryName))) {
+      const comment = entry.comment || "";
+      const keys = entry.key || [];
+      if (comment === entryName || keys.includes(entryName)) {
+        console.log("[聊天总结] 找到条目:", uid, "内容长度:", entry.content?.length);
         return entry.content;
       }
     }
     
+    console.log("[聊天总结] 未找到条目:", entryName);
     return null;
   } catch (e) {
     console.error("[聊天总结] 读取世界书失败:", e);
@@ -657,6 +706,13 @@ async function generateSmallSummary(content) {
     return;
   }
   
+  const settings = getSettings();
+  
+  if (!settings.selectedWorldbook) {
+    toastr.warning("请先选择目标世界书", "聊天总结");
+    return;
+  }
+  
   isProcessing = true;
   toastr.info("正在生成小总结...", "聊天总结");
   
@@ -665,18 +721,17 @@ async function generateSmallSummary(content) {
     const summary = await callAI(prompt);
     
     if (summary && summary.trim()) {
-      const settings = getSettings();
-      
       // 读取现有小总结
       let existingSummaries = await readFromWorldbook(settings.smallSummaryEntryName) || "";
       
       // 添加新总结
       const timestamp = new Date().toLocaleString("zh-CN");
-      const newEntry = existingSummaries ? `\n\n---\n\n【${timestamp}】\n${summary.trim()}` : `【${timestamp}】\n${summary.trim()}`;
-      const finalContent = existingSummaries + newEntry;
+      const newEntry = existingSummaries 
+        ? `${existingSummaries}\n\n---\n\n【${timestamp}】\n${summary.trim()}`
+        : `【${timestamp}】\n${summary.trim()}`;
       
       // 保存到世界书
-      const saved = await saveToWorldbook(settings.smallSummaryEntryName, finalContent.trim());
+      const saved = await saveToWorldbook(settings.smallSummaryEntryName, newEntry);
       
       if (saved) {
         toastr.success("小总结已生成并保存到世界书", "聊天总结");
@@ -686,6 +741,7 @@ async function generateSmallSummary(content) {
     }
   } catch (e) {
     toastr.error("生成失败: " + e.message, "聊天总结");
+    console.error("[聊天总结] 生成小总结失败:", e);
   } finally {
     isProcessing = false;
   }
@@ -699,11 +755,16 @@ async function generateBigSummary() {
   
   const settings = getSettings();
   
+  if (!settings.selectedWorldbook) {
+    toastr.warning("请先选择目标世界书", "聊天总结");
+    return;
+  }
+  
   // 从世界书读取小总结
   const smallSummaries = await readFromWorldbook(settings.smallSummaryEntryName);
   
   if (!smallSummaries) {
-    toastr.warning("世界书中没有找到小总结内容", "聊天总结");
+    toastr.warning("世界书中没有找到小总结内容，请先生成小总结", "聊天总结");
     return;
   }
   
@@ -727,6 +788,7 @@ async function generateBigSummary() {
       }
     } catch (e) {
       toastr.error("生成失败: " + e.message, "聊天总结");
+      console.error("[聊天总结] 生成大总结失败:", e);
     } finally {
       isProcessing = false;
     }
@@ -740,20 +802,10 @@ function updateUI() {
   if (!settings) return;
   
   $("#chat_summary_enabled").prop("checked", settings.enabled);
-  $("#chat_summary_use_custom_api").prop("checked", settings.useCustomApi);
-  $("#chat_summary_api_url").val(settings.apiUrl);
-  $("#chat_summary_api_key").val(settings.apiKey);
-  $("#chat_summary_api_model").val(settings.apiModel);
   $("#chat_summary_floor_range").val(settings.floorRange);
   $("#chat_summary_exclude").val(settings.excludePattern);
   $("#chat_summary_small_entry").val(settings.smallSummaryEntryName);
   $("#chat_summary_big_entry").val(settings.bigSummaryEntryName);
-  
-  if (settings.useCustomApi) {
-    $("#chat_summary_api_settings").show();
-  } else {
-    $("#chat_summary_api_settings").hide();
-  }
 }
 
 function createUI() {
@@ -770,37 +822,32 @@ function createUI() {
         <div class="chat-summary-section">
           <div class="chat-summary-row">
             <label class="checkbox_label">
-              <input type="checkbox" id="chat_summary_enabled">
+              <input type="checkbox" id="chat_summary_enabled" checked>
               <span>启用扩展</span>
             </label>
           </div>
         </div>
         
-        <!-- API设置 -->
+        <!-- 世界书设置 -->
         <div class="chat-summary-section">
-          <div class="chat-summary-section-title">🔌 API设置</div>
+          <div class="chat-summary-section-title">📖 世界书设置</div>
           <div class="chat-summary-row">
-            <label class="checkbox_label">
-              <input type="checkbox" id="chat_summary_use_custom_api">
-              <span>使用独立API（暂不可用）</span>
-            </label>
+            <label>目标世界书</label>
+            <select id="chat_summary_worldbook" class="text_pole">
+              <option value="">-- 选择世界书 --</option>
+            </select>
           </div>
-          <div id="chat_summary_api_settings" style="display: none;">
-            <div class="chat-summary-row">
-              <label>API地址</label>
-              <input type="text" id="chat_summary_api_url" class="text_pole" placeholder="http://127.0.0.1:8888">
-            </div>
-            <div class="chat-summary-row">
-              <label>API密钥</label>
-              <input type="password" id="chat_summary_api_key" class="text_pole" placeholder="sk-xxx">
-            </div>
-            <div class="chat-summary-row">
-              <label>模型名称</label>
-              <input type="text" id="chat_summary_api_model" class="text_pole" placeholder="直接输入模型名">
-            </div>
-            <p style="font-size: 11px; opacity: 0.6; margin-top: 5px; color: #e74c3c;">⚠️ 由于浏览器CORS限制，独立API暂不可用，请使用酒馆自带API</p>
+          <div class="chat-summary-row">
+            <div class="menu_button" id="chat_summary_refresh_wb">🔄 刷新列表</div>
           </div>
-          <p style="font-size: 12px; opacity: 0.7; margin-top: 5px;">当前使用酒馆已连接的API</p>
+          <div class="chat-summary-row">
+            <label>小总结条目名</label>
+            <input type="text" id="chat_summary_small_entry" class="text_pole" value="小总结">
+          </div>
+          <div class="chat-summary-row">
+            <label>大总结条目名</label>
+            <input type="text" id="chat_summary_big_entry" class="text_pole" value="大总结">
+          </div>
         </div>
         
         <!-- 小总结设置 -->
@@ -819,36 +866,16 @@ function createUI() {
           </div>
         </div>
         
-        <!-- 大总结设置 -->
+        <!-- 大总结 -->
         <div class="chat-summary-section">
           <div class="chat-summary-section-title">📚 大总结</div>
           <div class="chat-summary-row">
             <div class="menu_button" id="chat_summary_gen_big">📚 生成大总结</div>
           </div>
-          <p style="font-size: 12px; opacity: 0.7; margin-top: 5px;">从小总结条目读取内容进行合并</p>
+          <p style="font-size: 12px; opacity: 0.7; margin-top: 5px;">从世界书的小总结条目读取内容进行合并</p>
         </div>
         
-        <!-- 世界书设置 -->
-        <div class="chat-summary-section">
-          <div class="chat-summary-section-title">📖 世界书设置</div>
-          <div class="chat-summary-row">
-            <label>目标世界书</label>
-            <select id="chat_summary_worldbook" class="text_pole">
-              <option value="">-- 选择世界书 --</option>
-            </select>
-          </div>
-          <div class="chat-summary-row">
-            <div class="menu_button" id="chat_summary_refresh_wb">🔄 刷新世界书列表</div>
-          </div>
-          <div class="chat-summary-row">
-            <label>小总结条目名</label>
-            <input type="text" id="chat_summary_small_entry" class="text_pole" value="小总结">
-          </div>
-          <div class="chat-summary-row">
-            <label>大总结条目名</label>
-            <input type="text" id="chat_summary_big_entry" class="text_pole" value="大总结">
-          </div>
-        </div>
+        <p style="font-size: 11px; opacity: 0.5; margin-top: 10px;">使用酒馆已连接的API生成总结</p>
         
       </div>
     </div>
@@ -863,28 +890,6 @@ function bindEvents() {
   
   $("#chat_summary_enabled").on("change", function() {
     settings.enabled = $(this).prop("checked");
-    saveSettings();
-  });
-  
-  // API设置
-  $("#chat_summary_use_custom_api").on("change", function() {
-    settings.useCustomApi = $(this).prop("checked");
-    saveSettings();
-    updateUI();
-  });
-  
-  $("#chat_summary_api_url").on("change", function() {
-    settings.apiUrl = $(this).val().trim();
-    saveSettings();
-  });
-  
-  $("#chat_summary_api_key").on("change", function() {
-    settings.apiKey = $(this).val().trim();
-    saveSettings();
-  });
-  
-  $("#chat_summary_api_model").on("change", function() {
-    settings.apiModel = $(this).val().trim();
     saveSettings();
   });
   
