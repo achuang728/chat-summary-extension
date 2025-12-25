@@ -1,5 +1,5 @@
 import { extension_settings, getContext } from "../../../extensions.js";
-import { saveSettingsDebounced } from "../../../../script.js";
+import { saveSettingsDebounced, getRequestHeaders, generateRaw } from "../../../../script.js";
 
 // 世界书模块 - 动态获取
 let worldInfoModule = null;
@@ -79,26 +79,10 @@ function getSettings() {
 
 // ============ API调用 ============
 
-// 构建正确的API端点URL
-function buildApiEndpoint(apiUrl) {
-  let url = apiUrl.trim().replace(/\/+$/, "");
-  
-  // 如果已经包含完整路径，直接返回
-  if (url.endsWith("/chat/completions")) {
-    return url;
-  }
-  // 如果包含 /v1 但不完整
-  if (url.endsWith("/v1")) {
-    return `${url}/chat/completions`;
-  }
-  // 如果包含 /v1/ 在中间
-  if (url.includes("/v1/") && !url.endsWith("/chat/completions")) {
-    return url.replace(/\/v1\/.*$/, "/v1/chat/completions");
-  }
-  // 默认添加完整路径
-  return `${url}/v1/chat/completions`;
-}
-
+/**
+ * 通过酒馆后端代理调用自定义OpenAI兼容API
+ * 关键：请求从酒馆Node.js后端发出，不是从浏览器发出，所以没有CORS问题
+ */
 async function callCustomApi(prompt) {
   const settings = getSettings();
   
@@ -106,100 +90,83 @@ async function callCustomApi(prompt) {
     throw new Error("请先配置API地址、密钥和模型");
   }
   
-  const endpoint = buildApiEndpoint(settings.apiUrl);
-  console.log("[聊天总结] 调用自定义API:", endpoint);
-  
-  const requestBody = {
-    model: settings.apiModel,
-    messages: [{ role: "user", content: prompt }],
-    max_tokens: 2000,
-    temperature: 0.7
-  };
-  
-  try {
-    // 首先尝试直接请求
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${settings.apiKey}`
-      },
-      body: JSON.stringify(requestBody)
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`API错误 ${response.status}: ${errorText}`);
-    }
-    
-    const data = await response.json();
-    return data.choices[0].message.content;
-    
-  } catch (error) {
-    // 如果是CORS错误，尝试通过酒馆代理
-    if (error.message.includes("Failed to fetch") || error.message.includes("CORS")) {
-      console.log("[聊天总结] 检测到CORS问题，尝试通过酒馆代理...");
-      return await callCustomApiViaProxy(endpoint, requestBody, settings.apiKey);
-    }
-    throw error;
+  // 构建API端点
+  let apiUrl = settings.apiUrl.trim().replace(/\/+$/, "");
+  if (!apiUrl.endsWith("/v1")) {
+    apiUrl = `${apiUrl}/v1`;
   }
-}
-
-// 通过酒馆代理调用API（绕过CORS）
-async function callCustomApiViaProxy(endpoint, requestBody, apiKey) {
-  console.log("[聊天总结] 使用酒馆代理调用API");
   
-  const response = await fetch("/api/backends/custom/generate", {
+  console.log("[聊天总结] 调用自定义API:", apiUrl);
+  
+  // 通过酒馆后端的代理端点发送请求
+  const response = await fetch("/api/backends/chat-completions/generate", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    headers: getRequestHeaders(),
     body: JSON.stringify({
-      url: endpoint,
-      body: requestBody,
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`
-      }
+      chat_completion_source: "custom",
+      custom_url: apiUrl,
+      custom_include_headers: JSON.stringify({
+        "Authorization": `Bearer ${settings.apiKey}`,
+        "Content-Type": "application/json"
+      }),
+      model: settings.apiModel,
+      max_tokens: 2000,
+      temperature: 0.7,
+      messages: [
+        { role: "user", content: prompt }
+      ],
+      stream: false
     })
   });
   
   if (!response.ok) {
-    // 如果酒馆代理也失败，尝试备用方案
-    console.log("[聊天总结] 酒馆代理失败，尝试备用方案...");
-    return await callCustomApiViaBypass(endpoint, requestBody, apiKey);
+    const errorText = await response.text();
+    console.error("[聊天总结] API错误:", response.status, errorText);
+    throw new Error(`API错误 ${response.status}: ${errorText.substring(0, 200)}`);
   }
   
-  const data = await response.json();
-  return data.choices?.[0]?.message?.content || data.content || data;
+  const text = await response.text();
+  
+  try {
+    const data = JSON.parse(text);
+    if (data.choices && data.choices[0]) {
+      return data.choices[0].message?.content || data.choices[0].text || "";
+    }
+    if (data.content) {
+      return data.content;
+    }
+    return text;
+  } catch {
+    return text;
+  }
 }
 
-// 备用方案：通过酒馆的通用代理端点
-async function callCustomApiViaBypass(endpoint, requestBody, apiKey) {
-  // 尝试使用 /proxy 端点
-  const response = await fetch("/proxy", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Real-URL": endpoint,
-      "X-Real-Method": "POST",
-      "X-Real-Headers": JSON.stringify({
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`
-      })
-    },
-    body: JSON.stringify(requestBody)
-  });
+/**
+ * 使用酒馆主API（通过generateRaw）
+ * generateRaw从后端发送请求，没有CORS问题
+ */
+async function callMainApi(prompt) {
+  return await generateRaw(prompt);
+}
+
+/**
+ * 统一的AI调用入口
+ */
+async function callAI(prompt) {
+  const settings = getSettings();
   
-  if (!response.ok) {
-    throw new Error(`代理请求失败。请在API服务器启用CORS，或检查API配置。\n\n解决方案：\n1. 如果是llama.cpp: 添加 --cors 参数\n2. 如果是Ollama: 设置 OLLAMA_ORIGINS=*\n3. 如果是text-gen-webui: 启用 --api-cors`);
+  if (settings.useCustomApi && settings.apiUrl && settings.apiKey && settings.apiModel) {
+    console.log("[聊天总结] 使用独立API");
+    return await callCustomApi(prompt);
   }
   
-  const data = await response.json();
-  return data.choices?.[0]?.message?.content || data.content || data;
+  console.log("[聊天总结] 使用酒馆主API");
+  return await callMainApi(prompt);
 }
 
-// 测试API连接
+/**
+ * 测试API连接
+ */
 async function testCustomApi() {
   const settings = getSettings();
   
@@ -211,24 +178,12 @@ async function testCustomApi() {
   toastr.info("正在测试API连接...", "聊天总结");
   
   try {
-    const result = await callCustomApi("请回复'API连接成功'这四个字");
-    toastr.success(`API测试成功！\n回复: ${result.substring(0, 50)}...`, "聊天总结", { timeOut: 5000 });
+    const result = await callCustomApi("请回复'测试成功'这四个字");
+    toastr.success(`API测试成功！回复: ${result.substring(0, 50)}...`, "聊天总结", { timeOut: 5000 });
   } catch (error) {
     toastr.error(`API测试失败: ${error.message}`, "聊天总结", { timeOut: 10000 });
     console.error("[聊天总结] API测试失败:", error);
   }
-}
-
-async function callAI(prompt) {
-  const settings = getSettings();
-  
-  if (settings.useCustomApi && settings.apiUrl && settings.apiKey && settings.apiModel) {
-    return await callCustomApi(prompt);
-  }
-  
-  // 使用酒馆API
-  const context = getContext();
-  return await context.generateQuietPrompt(prompt, false, false);
 }
 
 // ============ 世界书操作 ============
@@ -236,7 +191,6 @@ async function callAI(prompt) {
 async function getWorldbooks() {
   const worldbookList = [];
   
-  // 从DOM获取
   $("#world_info option, #world_editor_select option").each(function() {
     const val = $(this).val();
     const text = $(this).text().trim();
@@ -247,7 +201,6 @@ async function getWorldbooks() {
     }
   });
   
-  // 从角色获取
   const context = getContext();
   if (context.characters && context.characterId !== undefined) {
     const char = context.characters[context.characterId];
@@ -282,7 +235,6 @@ async function updateWorldbookSelect() {
   toastr.success(`找到 ${worldbooks.length} 个世界书`, "聊天总结");
 }
 
-// 操作世界书条目
 async function saveToWorldbook(entryName, content) {
   const settings = getSettings();
   const worldbookName = settings.selectedWorldbook;
@@ -295,283 +247,233 @@ async function saveToWorldbook(entryName, content) {
   console.log("[聊天总结] 保存到世界书:", worldbookName, "条目:", entryName);
   
   try {
-    // 方法1: 使用SillyTavern的全局函数
-    if (typeof window.saveWorldInfo === 'function') {
-      console.log("[聊天总结] 使用全局saveWorldInfo");
-      // 先获取数据
-      const data = await window.getWorldInfo?.(worldbookName);
-      if (data) {
-        // 更新或添加条目
-        // ...
-      }
-    }
-    
-    // 方法2: 直接操作world_info对象
-    if (typeof world_info !== 'undefined') {
-      console.log("[聊天总结] 找到全局world_info对象");
-      const entries = world_info?.data?.entries || world_info?.entries;
-      if (entries) {
-        let found = false;
-        for (const uid in entries) {
-          if (entries[uid].comment === entryName || entries[uid].key?.includes(entryName)) {
-            entries[uid].content = content;
-            found = true;
-            break;
-          }
-        }
-        if (!found) {
-          const newUid = Date.now();
-          entries[newUid] = {
-            uid: newUid,
-            key: [entryName],
-            comment: entryName,
-            content: content,
-            constant: true,
-            disable: false,
-            order: 100,
-            position: 0
-          };
-        }
-        
-        // 触发保存事件
-        $(document).trigger('worldInfoUpdated');
-        console.log("[聊天总结] 已更新world_info对象");
-      }
-    }
-    
-    // 方法3: 使用jQuery事件触发酒馆保存
-    const $saveBtn = $('[id*="world_info_save"], .world_info_save');
-    if ($saveBtn.length) {
-      $saveBtn.trigger('click');
-      console.log("[聊天总结] 触发保存按钮");
-      return true;
-    }
-    
-    // 方法4: 使用fetch但加上正确的headers
-    const csrfToken = $('meta[name="csrf-token"]').attr('content') || '';
-    
     // 先读取现有数据
-    const getResp = await fetch("/getWorldInfo", {
+    const getResp = await fetch("/api/worldinfo/get", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-CSRF-Token": csrfToken
-      },
+      headers: getRequestHeaders(),
       body: JSON.stringify({ name: worldbookName })
     });
     
-    if (getResp.ok) {
-      const worldData = await getResp.json();
-      const entries = worldData.entries || {};
-      
-      // 查找或创建条目
-      let found = false;
-      for (const uid in entries) {
-        if (entries[uid].comment === entryName || entries[uid].key?.includes(entryName)) {
-          entries[uid].content = content;
-          found = true;
-          break;
-        }
-      }
-      
-      if (!found) {
-        const newUid = Object.keys(entries).length;
-        entries[newUid] = {
-          uid: newUid,
-          key: [entryName],
-          comment: entryName,
-          content: content,
-          constant: true,
-          disable: false
-        };
-      }
-      
-      // 保存
-      const saveResp = await fetch("/saveWorldInfo", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-CSRF-Token": csrfToken
-        },
-        body: JSON.stringify({
-          name: worldbookName,
-          data: { entries }
-        })
-      });
-      
-      if (saveResp.ok) {
-        console.log("[聊天总结] fetch保存成功");
-        return true;
+    if (!getResp.ok) {
+      throw new Error("无法读取世界书");
+    }
+    
+    const worldData = await getResp.json();
+    const entries = worldData.entries || {};
+    
+    // 查找或创建条目
+    let found = false;
+    let targetUid = null;
+    for (const uid in entries) {
+      if (entries[uid].comment === entryName || entries[uid].key?.includes(entryName)) {
+        entries[uid].content = content;
+        found = true;
+        targetUid = uid;
+        break;
       }
     }
     
-    console.log("[聊天总结] 所有方法都失败");
-    return false;
+    if (!found) {
+      // 创建新条目
+      const newUid = Date.now();
+      entries[newUid] = {
+        uid: newUid,
+        key: [entryName],
+        keysecondary: [],
+        comment: entryName,
+        content: content,
+        constant: true,
+        vectorized: false,
+        selective: false,
+        selectiveLogic: 0,
+        addMemo: true,
+        order: 100,
+        position: 0,
+        disable: false,
+        excludeRecursion: false,
+        preventRecursion: false,
+        delayUntilRecursion: false,
+        probability: 100,
+        useProbability: true,
+        depth: 4,
+        group: "",
+        groupOverride: false,
+        groupWeight: 100,
+        scanDepth: null,
+        caseSensitive: null,
+        matchWholeWords: null,
+        useGroupScoring: null,
+        automationId: "",
+        role: null,
+        sticky: null,
+        cooldown: null,
+        delay: null
+      };
+    }
     
-  } catch (e) {
-    console.error("[聊天总结] 保存失败:", e);
+    // 保存世界书
+    const saveResp = await fetch("/api/worldinfo/edit", {
+      method: "POST",
+      headers: getRequestHeaders(),
+      body: JSON.stringify({
+        name: worldbookName,
+        data: { entries }
+      })
+    });
+    
+    if (saveResp.ok) {
+      console.log("[聊天总结] 世界书保存成功");
+      return true;
+    } else {
+      const errText = await saveResp.text();
+      console.error("[聊天总结] 保存失败:", errText);
+      toastr.error("保存世界书失败", "聊天总结");
+      return false;
+    }
+  } catch (error) {
+    console.error("[聊天总结] 保存世界书失败:", error);
+    toastr.error("保存世界书失败: " + error.message, "聊天总结");
     return false;
   }
 }
 
-// 从世界书读取
 async function readFromWorldbook(entryName) {
   const settings = getSettings();
   const worldbookName = settings.selectedWorldbook;
   
   if (!worldbookName) return null;
   
-  console.log("[聊天总结] 从世界书读取:", worldbookName, "条目:", entryName);
-  
   try {
-    // 方法1: 检查全局world_info
-    if (typeof world_info !== 'undefined') {
-      const entries = world_info?.data?.entries || world_info?.entries;
-      if (entries) {
-        for (const uid in entries) {
-          if (entries[uid].comment === entryName || entries[uid].key?.includes(entryName)) {
-            console.log("[聊天总结] 从全局world_info读取成功");
-            return entries[uid].content;
-          }
-        }
-      }
-    }
-    
-    // 方法2: 使用fetch
-    const csrfToken = $('meta[name="csrf-token"]').attr('content') || '';
-    
-    const resp = await fetch("/getWorldInfo", {
+    const response = await fetch("/api/worldinfo/get", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-CSRF-Token": csrfToken
-      },
+      headers: getRequestHeaders(),
       body: JSON.stringify({ name: worldbookName })
     });
     
-    if (resp.ok) {
-      const data = await resp.json();
-      const entries = data.entries || {};
-      
-      for (const uid in entries) {
-        if (entries[uid].comment === entryName || entries[uid].key?.includes(entryName)) {
-          console.log("[聊天总结] 从API读取成功");
-          return entries[uid].content;
-        }
+    if (!response.ok) return null;
+    
+    const worldData = await response.json();
+    const entries = worldData.entries || {};
+    
+    for (const uid in entries) {
+      if (entries[uid].comment === entryName || entries[uid].key?.includes(entryName)) {
+        return entries[uid].content;
       }
     }
     
     return null;
-  } catch (e) {
-    console.error("[聊天总结] 读取失败:", e);
+  } catch (error) {
+    console.error("[聊天总结] 读取世界书失败:", error);
     return null;
   }
 }
 
-// ============ 楼层选择 ============
-
-function parseFloorRange(rangeStr) {
-  const parts = rangeStr.split("-");
-  if (parts.length !== 2) return { start: 0, end: 10 };
-  return {
-    start: parseInt(parts[0].trim()) || 0,
-    end: parseInt(parts[1].trim()) || 10
-  };
-}
+// ============ 聊天内容处理 ============
 
 function getSelectedContent() {
-  const context = getContext();
-  const chat = context.chat;
   const settings = getSettings();
+  const context = getContext();
   
-  if (!chat || chat.length === 0) {
+  if (!context.chat || context.chat.length === 0) {
     return { content: "", messages: [] };
   }
   
-  const { start, end } = parseFloorRange(settings.floorRange);
-  const messages = [];
+  const rangeStr = settings.floorRange || "0-10";
+  let [start, end] = rangeStr.split("-").map(s => parseInt(s.trim()));
   
-  for (let i = start; i <= end && i < chat.length; i++) {
-    const msg = chat[i];
-    if (!msg) continue;
-    
-    let content = msg.mes || "";
-    
-    if (settings.excludePattern && settings.excludePattern.trim()) {
-      try {
-        const regex = new RegExp(settings.excludePattern, "gi");
-        content = content.replace(regex, "");
-      } catch (e) {}
-    }
-    
-    content = content.trim();
-    if (content) {
-      messages.push({
-        floor: i,
-        name: msg.name || (msg.is_user ? "用户" : "AI"),
-        content: content
-      });
-    }
+  if (isNaN(start)) start = 0;
+  if (isNaN(end)) end = context.chat.length - 1;
+  
+  start = Math.max(0, start);
+  end = Math.min(context.chat.length - 1, end);
+  
+  if (start > end) {
+    [start, end] = [end, start];
   }
   
-  const formattedContent = messages.map(m => 
-    `【第${m.floor}楼 - ${m.name}】\n${m.content}`
-  ).join("\n\n---\n\n");
+  const messages = [];
+  const excludeRegex = settings.excludePattern ? new RegExp(settings.excludePattern, "gi") : null;
   
-  return { content: formattedContent, messages };
+  for (let i = start; i <= end; i++) {
+    const msg = context.chat[i];
+    if (!msg || msg.is_system) continue;
+    
+    let text = msg.mes || "";
+    
+    if (excludeRegex) {
+      text = text.replace(excludeRegex, "");
+    }
+    
+    text = text.trim();
+    if (!text) continue;
+    
+    const role = msg.is_user ? "用户" : (msg.name || "角色");
+    messages.push({
+      index: i,
+      role,
+      text
+    });
+  }
+  
+  const content = messages.map(m => `[${m.role}]: ${m.text}`).join("\n\n");
+  
+  return { content, messages };
 }
 
 // ============ 弹窗 ============
 
 function showPreviewPopup(content, onConfirm) {
-  $("#chat_summary_popup_overlay").remove();
+  const html = `
+    <div style="max-height:400px;overflow-y:auto;padding:10px;background:#1a1a1a;border-radius:5px;margin-bottom:15px;">
+      <pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;color:#ddd;">${escapeHtml(content)}</pre>
+    </div>
+    <div style="text-align:right;">
+      <button id="popup_cancel" class="menu_button">取消</button>
+      <button id="popup_confirm" class="menu_button" style="margin-left:10px;">确认生成</button>
+    </div>
+  `;
   
-  $("body").append(`
-    <div id="chat_summary_popup_overlay" style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:99999;display:flex;align-items:center;justify-content:center;">
-      <div style="background:#1e1e2e;border-radius:12px;width:90%;max-width:600px;max-height:80vh;display:flex;flex-direction:column;">
-        <div style="padding:16px 20px;background:linear-gradient(135deg,#667eea,#764ba2);border-radius:12px 12px 0 0;display:flex;justify-content:space-between;align-items:center;">
-          <span style="font-weight:600;">📄 待总结内容预览</span>
-          <button id="chat_summary_popup_close" style="background:rgba(255,255,255,0.2);border:none;color:white;width:32px;height:32px;border-radius:50%;cursor:pointer;">×</button>
-        </div>
-        <div style="padding:16px;overflow-y:auto;flex:1;font-size:14px;line-height:1.6;white-space:pre-wrap;color:#e0e0e0;">${escapeHtml(content)}</div>
-        <div style="padding:16px;display:flex;gap:12px;border-top:1px solid rgba(255,255,255,0.1);">
-          <button id="chat_summary_popup_cancel" style="flex:1;padding:12px;background:#444;border:none;border-radius:8px;color:white;cursor:pointer;">取消</button>
-          <button id="chat_summary_popup_confirm" style="flex:1;padding:12px;background:linear-gradient(135deg,#667eea,#764ba2);border:none;border-radius:8px;color:white;cursor:pointer;font-weight:600;">✨ 开始总结</button>
-        </div>
+  const popup = document.createElement("div");
+  popup.innerHTML = `
+    <div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center;">
+      <div style="background:#2a2a2a;padding:20px;border-radius:10px;max-width:600px;width:90%;">
+        <h3 style="margin-top:0;color:#fff;">预览内容</h3>
+        ${html}
       </div>
     </div>
-  `);
+  `;
   
-  $("#chat_summary_popup_close, #chat_summary_popup_cancel").on("click", () => $("#chat_summary_popup_overlay").remove());
-  $("#chat_summary_popup_confirm").on("click", () => {
-    $("#chat_summary_popup_overlay").remove();
-    if (onConfirm) onConfirm();
-  });
+  document.body.appendChild(popup);
+  
+  popup.querySelector("#popup_cancel").onclick = () => popup.remove();
+  popup.querySelector("#popup_confirm").onclick = () => {
+    popup.remove();
+    onConfirm();
+  };
 }
 
 function showResultPopup(title, content) {
-  $("#chat_summary_popup_overlay").remove();
+  const html = `
+    <div style="max-height:400px;overflow-y:auto;padding:10px;background:#1a1a1a;border-radius:5px;margin-bottom:15px;">
+      <pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;color:#ddd;">${escapeHtml(content)}</pre>
+    </div>
+    <div style="text-align:right;">
+      <button id="popup_close" class="menu_button">关闭</button>
+    </div>
+  `;
   
-  $("body").append(`
-    <div id="chat_summary_popup_overlay" style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:99999;display:flex;align-items:center;justify-content:center;">
-      <div style="background:#1e1e2e;border-radius:12px;width:90%;max-width:600px;max-height:80vh;display:flex;flex-direction:column;">
-        <div style="padding:16px 20px;background:linear-gradient(135deg,#27ae60,#2ecc71);border-radius:12px 12px 0 0;display:flex;justify-content:space-between;align-items:center;">
-          <span style="font-weight:600;">✅ ${escapeHtml(title)}</span>
-          <button id="chat_summary_popup_close" style="background:rgba(255,255,255,0.2);border:none;color:white;width:32px;height:32px;border-radius:50%;cursor:pointer;">×</button>
-        </div>
-        <div style="padding:16px;overflow-y:auto;flex:1;font-size:14px;line-height:1.6;white-space:pre-wrap;color:#e0e0e0;user-select:text;">${escapeHtml(content)}</div>
-        <div style="padding:16px;display:flex;gap:12px;border-top:1px solid rgba(255,255,255,0.1);">
-          <button id="chat_summary_copy_btn" style="flex:1;padding:12px;background:linear-gradient(135deg,#667eea,#764ba2);border:none;border-radius:8px;color:white;cursor:pointer;font-weight:600;">📋 复制</button>
-          <button id="chat_summary_popup_cancel" style="flex:1;padding:12px;background:#444;border:none;border-radius:8px;color:white;cursor:pointer;">关闭</button>
-        </div>
+  const popup = document.createElement("div");
+  popup.innerHTML = `
+    <div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center;">
+      <div style="background:#2a2a2a;padding:20px;border-radius:10px;max-width:600px;width:90%;">
+        <h3 style="margin-top:0;color:#fff;">${title}</h3>
+        ${html}
       </div>
     </div>
-  `);
+  `;
   
-  $("#chat_summary_popup_close, #chat_summary_popup_cancel").on("click", () => $("#chat_summary_popup_overlay").remove());
-  $("#chat_summary_copy_btn").on("click", () => {
-    navigator.clipboard.writeText(content).then(() => toastr.success("已复制", "聊天总结"));
-  });
+  document.body.appendChild(popup);
+  popup.querySelector("#popup_close").onclick = () => popup.remove();
 }
 
 function escapeHtml(text) {
@@ -723,6 +625,7 @@ function createUI() {
               <input type="checkbox" id="chat_summary_use_custom_api">
               <span>使用独立API</span>
             </label>
+            <p style="font-size:11px;opacity:0.6;margin:5px 0 0 0;">关闭则使用酒馆主界面配置的API</p>
           </div>
           <div id="chat_summary_api_settings" style="display:none;margin-top:10px;">
             <div style="margin-bottom:8px;">
@@ -737,7 +640,7 @@ function createUI() {
               <label>模型名称</label>
               <input type="text" id="chat_summary_api_model" class="text_pole" placeholder="gpt-3.5-turbo">
             </div>
-            <div class="menu_button" id="chat_summary_test_api" style="margin-top:8px;">🔍 测试API连接</div>
+            <div class="menu_button" id="chat_summary_test_api" style="margin-top:5px;">🧪 测试连接</div>
           </div>
         </div>
         
