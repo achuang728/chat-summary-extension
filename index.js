@@ -1,19 +1,11 @@
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced } from "../../../../script.js";
-import { eventSource, event_types } from "../../../../script.js";
 
 const extensionName = "chat-summary-extension";
 
 // 默认设置
 const defaultSettings = {
   enabled: true,
-  autoSummary: false,
-  summaryInterval: 3,
-  contextTurns: 5,
-  maxChars: 400,
-  bigSummaryEnabled: true,
-  bigSummaryThreshold: 10,
-  bigSummaryKeepCount: 5,
   
   // API设置
   useCustomApi: false,
@@ -22,13 +14,14 @@ const defaultSettings = {
   apiModel: "",
   availableModels: [],
   
+  // 小总结设置
+  floorRange: "0-10",
+  excludePattern: "<thinking>[\\s\\S]*?</thinking>",
+  
   // 世界书设置
   selectedWorldbook: "",
   smallSummaryEntryName: "小总结",
   bigSummaryEntryName: "大总结",
-  
-  currentTurn: 0,
-  summaries: []
 };
 
 // 提示词
@@ -38,25 +31,24 @@ const SMALL_SUMMARY_PROMPT = `你是剧情记录助手。请根据以下对话�
 1. 客观记录发生的事件、对话、人物行动
 2. 保留关键信息（人物、地点、重要对话）
 3. 使用第三人称
-4. 字数控制在{{maxChars}}字以内
+4. 字数控制在400字以内
 5. 直接输出总结内容，不要任何前缀说明
 
 对话内容：
 {{chatContent}}`;
 
-const BIG_SUMMARY_PROMPT = `你是剧情归纳助手。请将以下多条剧情总结合并精简为{{keepCount}}条核心总结。
+const BIG_SUMMARY_PROMPT = `你是剧情归纳助手。请将以下多条剧情小总结合并精简为更简洁的大总结。
 
 要求：
 1. 保留最重要的剧情发展
 2. 合并相似或连续的事件
-3. 每条总结300-500字
-4. 保持时间顺序
-5. 每条总结前加编号如 [1] [2] [3]
+3. 保持时间顺序
+4. 输出一段连贯的总结
 
-现有总结：
+现有小总结：
 {{summaries}}
 
-请输出合并后的{{keepCount}}条总结：`;
+请输出合并后的大总结：`;
 
 let isProcessing = false;
 
@@ -85,7 +77,6 @@ function getSettings() {
 
 // ============ API调用 ============
 
-// 使用自定义API调用
 async function callCustomApi(prompt) {
   const settings = getSettings();
   
@@ -114,7 +105,6 @@ async function callCustomApi(prompt) {
   return data.choices[0].message.content;
 }
 
-// 拉取可用模型
 async function fetchModels() {
   const settings = getSettings();
   
@@ -142,7 +132,6 @@ async function fetchModels() {
     settings.availableModels = models;
     saveSettings();
     
-    // 更新下拉框
     const $select = $("#chat_summary_model");
     $select.empty();
     $select.append(`<option value="">-- 选择模型 --</option>`);
@@ -160,7 +149,6 @@ async function fetchModels() {
   }
 }
 
-// 调用AI（根据设置选择API）
 async function callAI(prompt) {
   const settings = getSettings();
   
@@ -174,39 +162,92 @@ async function callAI(prompt) {
 
 // ============ 世界书操作 ============
 
-// 获取所有世界书
 async function getWorldbooks() {
   try {
-    const response = await fetch("/api/worldinfo/list");
-    if (!response.ok) return [];
+    const response = await fetch("/api/worldinfo/get-all");
+    if (!response.ok) {
+      // 尝试另一个API
+      const response2 = await fetch("/api/worldinfo");
+      if (!response2.ok) return [];
+      const data2 = await response2.json();
+      return Object.keys(data2.worldInfoData || {});
+    }
     const data = await response.json();
-    return data || [];
+    
+    // 处理不同格式的返回值
+    if (Array.isArray(data)) {
+      return data;
+    } else if (data.worldInfoData) {
+      return Object.keys(data.worldInfoData);
+    } else if (typeof data === 'object') {
+      return Object.keys(data);
+    }
+    return [];
   } catch (e) {
     console.error("[聊天总结] 获取世界书列表失败:", e);
+    
+    // 尝试从页面获取
+    try {
+      const context = getContext();
+      if (context.worldInfo) {
+        return Object.keys(context.worldInfo);
+      }
+    } catch (e2) {
+      console.error("[聊天总结] 备用方法也失败:", e2);
+    }
+    
     return [];
   }
 }
 
-// 更新世界书下拉框
 async function updateWorldbookSelect() {
-  const worldbooks = await getWorldbooks();
   const settings = getSettings();
   const $select = $("#chat_summary_worldbook");
   
   $select.empty();
   $select.append(`<option value="">-- 选择世界书 --</option>`);
   
+  // 方法1: 从API获取
+  const worldbooks = await getWorldbooks();
+  
+  // 方法2: 从页面DOM获取世界书列表
+  const $wbSelect = $("#world_info");
+  if ($wbSelect.length) {
+    $wbSelect.find("option").each(function() {
+      const val = $(this).val();
+      const text = $(this).text();
+      if (val && val !== "" && !worldbooks.includes(val)) {
+        worldbooks.push(val);
+      }
+    });
+  }
+  
+  // 方法3: 从角色世界书获取
+  const context = getContext();
+  if (context.characters && context.characterId !== undefined) {
+    const char = context.characters[context.characterId];
+    if (char?.data?.extensions?.world) {
+      const charWorld = char.data.extensions.world;
+      if (!worldbooks.includes(charWorld)) {
+        worldbooks.push(charWorld);
+      }
+    }
+  }
+  
   worldbooks.forEach(wb => {
-    const name = typeof wb === 'string' ? wb : wb.name;
-    $select.append(`<option value="${name}">${name}</option>`);
+    const name = typeof wb === 'string' ? wb : (wb.name || wb);
+    if (name) {
+      $select.append(`<option value="${name}">${name}</option>`);
+    }
   });
   
   if (settings.selectedWorldbook) {
     $select.val(settings.selectedWorldbook);
   }
+  
+  toastr.info(`找到 ${worldbooks.length} 个世界书`, "聊天总结");
 }
 
-// 保存内容到世界书条目
 async function saveToWorldbook(entryName, content) {
   const settings = getSettings();
   
@@ -216,7 +257,7 @@ async function saveToWorldbook(entryName, content) {
   }
   
   try {
-    // 获取世界书条目
+    // 获取世界书
     const response = await fetch(`/api/worldinfo/get?name=${encodeURIComponent(settings.selectedWorldbook)}`);
     if (!response.ok) {
       throw new Error("无法获取世界书");
@@ -226,22 +267,16 @@ async function saveToWorldbook(entryName, content) {
     const entries = worldbook.entries || {};
     
     // 查找或创建条目
-    let targetEntry = null;
-    let targetUid = null;
-    
+    let found = false;
     for (const [uid, entry] of Object.entries(entries)) {
-      if (entry.comment === entryName || entry.key?.includes(entryName)) {
-        targetEntry = entry;
-        targetUid = uid;
+      if (entry.comment === entryName || (entry.key && entry.key.includes(entryName))) {
+        entry.content = content;
+        found = true;
         break;
       }
     }
     
-    if (targetEntry) {
-      // 更新现有条目
-      targetEntry.content = content;
-    } else {
-      // 创建新条目
+    if (!found) {
       const newUid = Date.now().toString();
       entries[newUid] = {
         uid: newUid,
@@ -260,7 +295,7 @@ async function saveToWorldbook(entryName, content) {
       };
     }
     
-    // 保存世界书
+    // 保存
     const saveResponse = await fetch("/api/worldinfo/edit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -277,13 +312,12 @@ async function saveToWorldbook(entryName, content) {
     return true;
   } catch (e) {
     console.error("[聊天总结] 保存到世界书失败:", e);
-    toastr.error("保存到世界书失败: " + e.message, "聊天总结");
+    toastr.error("保存失败: " + e.message, "聊天总结");
     return false;
   }
 }
 
-// 从世界书读取小总结
-async function readSmallSummariesFromWorldbook() {
+async function readFromWorldbook(entryName) {
   const settings = getSettings();
   
   if (!settings.selectedWorldbook) {
@@ -298,7 +332,7 @@ async function readSmallSummariesFromWorldbook() {
     const entries = worldbook.entries || {};
     
     for (const [uid, entry] of Object.entries(entries)) {
-      if (entry.comment === settings.smallSummaryEntryName || entry.key?.includes(settings.smallSummaryEntryName)) {
+      if (entry.comment === entryName || (entry.key && entry.key.includes(entryName))) {
         return entry.content;
       }
     }
@@ -310,52 +344,202 @@ async function readSmallSummariesFromWorldbook() {
   }
 }
 
-// ============ 预览功能 ============
+// ============ 楼层选择和内容处理 ============
 
-function getPreviewContent() {
+function parseFloorRange(rangeStr) {
+  const parts = rangeStr.split("-");
+  if (parts.length !== 2) {
+    return { start: 0, end: 10 };
+  }
+  const start = parseInt(parts[0].trim()) || 0;
+  const end = parseInt(parts[1].trim()) || 10;
+  return { start, end };
+}
+
+function getSelectedContent() {
   const context = getContext();
   const chat = context.chat;
   const settings = getSettings();
   
-  if (!chat || chat.length < 1) {
-    return "暂无对话内容";
+  if (!chat || chat.length === 0) {
+    return { content: "", messages: [] };
   }
   
-  const turns = settings.contextTurns * 2;
-  const recent = chat.slice(-Math.min(turns, chat.length));
+  const { start, end } = parseFloorRange(settings.floorRange);
+  const messages = [];
   
-  let content = "";
-  recent.forEach(msg => {
-    const role = msg.is_user ? "👤 用户" : "🤖 AI";
-    const text = (msg.mes || "").substring(0, 500);
-    if (text.trim()) {
-      content += `${role}:\n${text}\n\n`;
+  for (let i = start; i <= end && i < chat.length; i++) {
+    const msg = chat[i];
+    if (!msg) continue;
+    
+    let content = msg.mes || "";
+    
+    // 排除指定内容
+    if (settings.excludePattern && settings.excludePattern.trim()) {
+      try {
+        const regex = new RegExp(settings.excludePattern, "gi");
+        content = content.replace(regex, "");
+      } catch (e) {
+        console.error("[聊天总结] 正则表达式错误:", e);
+      }
     }
-  });
+    
+    content = content.trim();
+    if (content) {
+      const role = msg.is_user ? "👤 用户" : "🤖 AI";
+      messages.push({
+        floor: i,
+        role: role,
+        name: msg.name || role,
+        content: content
+      });
+    }
+  }
   
-  return content || "暂无对话内容";
+  const formattedContent = messages.map(m => 
+    `【第${m.floor}楼 - ${m.name}】\n${m.content}`
+  ).join("\n\n---\n\n");
+  
+  return { content: formattedContent, messages };
 }
 
-function showPreview() {
-  const content = getPreviewContent();
-  $("#chat_summary_preview").text(content);
-  toastr.info(`已加载最近 ${getSettings().contextTurns} 轮对话`, "聊天总结");
+// ============ 弹窗预览 ============
+
+function showPreviewPopup(content, onConfirm) {
+  // 移除旧弹窗
+  $("#chat_summary_popup_overlay").remove();
+  
+  const popup = `
+    <div id="chat_summary_popup_overlay" style="
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.7);
+      z-index: 99999;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    ">
+      <div style="
+        background: #1e1e2e;
+        border-radius: 12px;
+        width: 90%;
+        max-width: 600px;
+        max-height: 80vh;
+        display: flex;
+        flex-direction: column;
+        box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+      ">
+        <div style="
+          padding: 16px 20px;
+          background: linear-gradient(135deg, #667eea, #764ba2);
+          border-radius: 12px 12px 0 0;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+        ">
+          <span style="font-weight: 600; font-size: 16px;">📄 待总结内容预览</span>
+          <button id="chat_summary_popup_close" style="
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 18px;
+          ">×</button>
+        </div>
+        <div style="
+          padding: 16px;
+          overflow-y: auto;
+          flex: 1;
+          font-size: 14px;
+          line-height: 1.6;
+          white-space: pre-wrap;
+          color: #e0e0e0;
+        ">${escapeHtml(content) || "没有选中任何内容"}</div>
+        <div style="
+          padding: 16px;
+          display: flex;
+          gap: 12px;
+          border-top: 1px solid rgba(255,255,255,0.1);
+        ">
+          <button id="chat_summary_popup_cancel" style="
+            flex: 1;
+            padding: 12px;
+            background: #444;
+            border: none;
+            border-radius: 8px;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+          ">取消</button>
+          <button id="chat_summary_popup_confirm" style="
+            flex: 1;
+            padding: 12px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            border: none;
+            border-radius: 8px;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+          ">✨ 开始总结</button>
+        </div>
+      </div>
+    </div>
+  `;
+  
+  $("body").append(popup);
+  
+  $("#chat_summary_popup_close, #chat_summary_popup_cancel").on("click", function() {
+    $("#chat_summary_popup_overlay").remove();
+  });
+  
+  $("#chat_summary_popup_confirm").on("click", function() {
+    $("#chat_summary_popup_overlay").remove();
+    if (onConfirm) onConfirm();
+  });
+}
+
+function escapeHtml(text) {
+  if (!text) return "";
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 
 // ============ 核心功能 ============
 
-// 生成小总结
-async function generateSmallSummary() {
+function previewSmallSummary() {
+  const { content, messages } = getSelectedContent();
+  
+  if (!content || messages.length === 0) {
+    toastr.warning("选中的楼层范围没有内容", "聊天总结");
+    return;
+  }
+  
+  showPreviewPopup(content, async () => {
+    await generateSmallSummary(content);
+  });
+}
+
+async function generateSmallSummary(content) {
   if (isProcessing) {
     toastr.warning("正在处理中...", "聊天总结");
     return;
   }
   
-  const context = getContext();
-  const chat = context.chat;
+  if (!content) {
+    const { content: c } = getSelectedContent();
+    content = c;
+  }
   
-  if (!chat || chat.length < 2) {
-    toastr.warning("对话记录不足", "聊天总结");
+  if (!content) {
+    toastr.warning("没有内容可总结", "聊天总结");
     return;
   }
   
@@ -363,59 +547,28 @@ async function generateSmallSummary() {
   toastr.info("正在生成小总结...", "聊天总结");
   
   try {
-    const settings = getSettings();
-    const turns = settings.contextTurns * 2;
-    const recent = chat.slice(-Math.min(turns, chat.length));
-    
-    let chatContent = "";
-    recent.forEach(msg => {
-      const role = msg.is_user ? "用户" : "AI";
-      const content = (msg.mes || "").substring(0, 2000);
-      if (content.trim()) {
-        chatContent += `【${role}】${content}\n\n`;
-      }
-    });
-    
-    if (!chatContent.trim()) {
-      toastr.warning("没有有效的对话内容", "聊天总结");
-      isProcessing = false;
-      return;
-    }
-    
-    const prompt = SMALL_SUMMARY_PROMPT
-      .replace("{{maxChars}}", settings.maxChars)
-      .replace("{{chatContent}}", chatContent);
-    
+    const prompt = SMALL_SUMMARY_PROMPT.replace("{{chatContent}}", content);
     const summary = await callAI(prompt);
     
     if (summary && summary.trim()) {
-      // 保存到内存
-      if (!settings.summaries) settings.summaries = [];
-      const newSummary = {
-        id: Date.now(),
-        time: new Date().toLocaleString("zh-CN"),
-        content: summary.trim(),
-        isMerged: false
-      };
-      settings.summaries.push(newSummary);
+      const settings = getSettings();
+      
+      // 读取现有小总结
+      let existingSummaries = await readFromWorldbook(settings.smallSummaryEntryName) || "";
+      
+      // 添加新总结
+      const timestamp = new Date().toLocaleString("zh-CN");
+      const newEntry = `\n\n---\n\n【${timestamp}】\n${summary.trim()}`;
+      existingSummaries += newEntry;
       
       // 保存到世界书
-      const allSmallSummaries = settings.summaries
-        .filter(s => !s.isMerged)
-        .map((s, i) => `[${i + 1}] (${s.time})\n${s.content}`)
-        .join("\n\n---\n\n");
+      const saved = await saveToWorldbook(settings.smallSummaryEntryName, existingSummaries.trim());
       
-      await saveToWorldbook(settings.smallSummaryEntryName, allSmallSummaries);
-      
-      saveSettings();
-      updateUI();
-      
-      toastr.success(`小总结已生成并保存（共${settings.summaries.length}条）`, "聊天总结");
-      
-      // 检查大总结
-      if (settings.bigSummaryEnabled && settings.summaries.filter(s => !s.isMerged).length >= settings.bigSummaryThreshold) {
-        toastr.info("达到阈值，可以生成大总结了", "聊天总结");
+      if (saved) {
+        toastr.success("小总结已生成并保存到世界书", "聊天总结");
       }
+    } else {
+      toastr.warning("AI返回内容为空", "聊天总结");
     }
   } catch (e) {
     toastr.error("生成失败: " + e.message, "聊天总结");
@@ -424,69 +577,46 @@ async function generateSmallSummary() {
   }
 }
 
-// 生成大总结（从世界书读取小总结）
 async function generateBigSummary() {
-  if (isProcessing) return;
+  if (isProcessing) {
+    toastr.warning("正在处理中...", "聊天总结");
+    return;
+  }
   
   const settings = getSettings();
   
   // 从世界书读取小总结
-  const smallSummariesContent = await readSmallSummariesFromWorldbook();
+  const smallSummaries = await readFromWorldbook(settings.smallSummaryEntryName);
   
-  if (!smallSummariesContent) {
+  if (!smallSummaries) {
     toastr.warning("世界书中没有找到小总结内容", "聊天总结");
     return;
   }
   
-  isProcessing = true;
-  toastr.info("正在生成大总结...", "聊天总结");
-  
-  try {
-    const prompt = BIG_SUMMARY_PROMPT
-      .replace(/\{\{keepCount\}\}/g, settings.bigSummaryKeepCount)
-      .replace("{{summaries}}", smallSummariesContent);
+  // 显示预览
+  showPreviewPopup(smallSummaries, async () => {
+    isProcessing = true;
+    toastr.info("正在生成大总结...", "聊天总结");
     
-    const result = await callAI(prompt);
-    
-    if (result && result.trim()) {
-      // 保存大总结到世界书
-      await saveToWorldbook(settings.bigSummaryEntryName, result.trim());
+    try {
+      const prompt = BIG_SUMMARY_PROMPT.replace("{{summaries}}", smallSummaries);
+      const result = await callAI(prompt);
       
-      toastr.success("大总结已生成并保存到世界书", "聊天总结");
-      updateUI();
+      if (result && result.trim()) {
+        const saved = await saveToWorldbook(settings.bigSummaryEntryName, result.trim());
+        
+        if (saved) {
+          toastr.success("大总结已生成并保存到世界书", "聊天总结");
+        }
+      } else {
+        toastr.warning("AI返回内容为空", "聊天总结");
+      }
+    } catch (e) {
+      toastr.error("生成失败: " + e.message, "聊天总结");
+    } finally {
+      isProcessing = false;
     }
-  } catch (e) {
-    toastr.error("生成失败: " + e.message, "聊天总结");
-  } finally {
-    isProcessing = false;
-  }
-}
-
-// 消息事件
-function onMessageReceived() {
-  const settings = getSettings();
-  if (!settings || !settings.enabled || !settings.autoSummary) return;
-  
-  settings.currentTurn++;
-  if (settings.currentTurn >= settings.summaryInterval) {
-    settings.currentTurn = 0;
-    saveSettings();
-    setTimeout(() => generateSmallSummary(), 1500);
-  } else {
-    saveSettings();
-  }
-  updateUI();
-}
-
-// 清空
-function clearSummaries() {
-  if (!confirm("确定清空所有总结？")) return;
-  const settings = getSettings();
-  settings.summaries = [];
-  settings.currentTurn = 0;
-  saveSettings();
-  updateUI();
-  toastr.success("已清空", "聊天总结");
+  });
 }
 
 // ============ UI ============
@@ -496,20 +626,14 @@ function updateUI() {
   if (!settings) return;
   
   $("#chat_summary_enabled").prop("checked", settings.enabled);
-  $("#chat_summary_auto").prop("checked", settings.autoSummary);
-  $("#chat_summary_interval").val(settings.summaryInterval);
-  $("#chat_summary_context").val(settings.contextTurns);
-  $("#chat_summary_threshold").val(settings.bigSummaryThreshold);
-  $("#chat_summary_keep").val(settings.bigSummaryKeepCount);
-  
   $("#chat_summary_use_custom_api").prop("checked", settings.useCustomApi);
   $("#chat_summary_api_url").val(settings.apiUrl);
   $("#chat_summary_api_key").val(settings.apiKey);
-  
+  $("#chat_summary_floor_range").val(settings.floorRange);
+  $("#chat_summary_exclude").val(settings.excludePattern);
   $("#chat_summary_small_entry").val(settings.smallSummaryEntryName);
   $("#chat_summary_big_entry").val(settings.bigSummaryEntryName);
   
-  // 显示/隐藏API设置
   if (settings.useCustomApi) {
     $("#chat_summary_api_settings").show();
   } else {
@@ -528,9 +652,6 @@ function updateUI() {
       $select.val(settings.apiModel);
     }
   }
-  
-  $("#chat_summary_turns").text(`${settings.currentTurn}/${settings.summaryInterval}`);
-  $("#chat_summary_count").text(settings.summaries ? settings.summaries.length : 0);
 }
 
 function createUI() {
@@ -543,30 +664,12 @@ function createUI() {
       </div>
       <div class="inline-drawer-content">
         
-        <!-- 状态 -->
-        <div class="chat-summary-status">
-          <div class="chat-summary-stat">
-            <span class="stat-value" id="chat_summary_turns">0/3</span>
-            <span class="stat-label">当前轮数</span>
-          </div>
-          <div class="chat-summary-stat">
-            <span class="stat-value" id="chat_summary_count">0</span>
-            <span class="stat-label">已保存</span>
-          </div>
-        </div>
-        
         <!-- 基本开关 -->
         <div class="chat-summary-section">
           <div class="chat-summary-row">
             <label class="checkbox_label">
               <input type="checkbox" id="chat_summary_enabled">
               <span>启用扩展</span>
-            </label>
-          </div>
-          <div class="chat-summary-row">
-            <label class="checkbox_label">
-              <input type="checkbox" id="chat_summary_auto">
-              <span>自动生成小总结</span>
             </label>
           </div>
         </div>
@@ -605,26 +708,25 @@ function createUI() {
         <div class="chat-summary-section">
           <div class="chat-summary-section-title">📌 小总结设置</div>
           <div class="chat-summary-row">
-            <label>每隔N轮生成</label>
-            <input type="number" id="chat_summary_interval" class="text_pole" min="1" max="20" value="3">
+            <label>选择楼层范围</label>
+            <input type="text" id="chat_summary_floor_range" class="text_pole" placeholder="0-10" value="0-10">
           </div>
           <div class="chat-summary-row">
-            <label>读取N轮对话</label>
-            <input type="number" id="chat_summary_context" class="text_pole" min="1" max="20" value="5">
+            <label>排除内容(正则)</label>
+            <input type="text" id="chat_summary_exclude" class="text_pole" placeholder="<thinking>[\\s\\S]*?</thinking>">
+          </div>
+          <div class="chat-summary-row">
+            <div class="menu_button" id="chat_summary_gen_small">✨ 生成小总结</div>
           </div>
         </div>
         
         <!-- 大总结设置 -->
         <div class="chat-summary-section">
-          <div class="chat-summary-section-title">📚 大总结设置</div>
+          <div class="chat-summary-section-title">📚 大总结</div>
           <div class="chat-summary-row">
-            <label>触发阈值(条)</label>
-            <input type="number" id="chat_summary_threshold" class="text_pole" min="3" max="50" value="10">
+            <div class="menu_button" id="chat_summary_gen_big">📚 生成大总结</div>
           </div>
-          <div class="chat-summary-row">
-            <label>精简后保留</label>
-            <input type="number" id="chat_summary_keep" class="text_pole" min="1" max="20" value="5">
-          </div>
+          <p style="font-size: 12px; opacity: 0.7; margin-top: 5px;">从小总结条目读取内容进行合并</p>
         </div>
         
         <!-- 世界书设置 -->
@@ -637,7 +739,7 @@ function createUI() {
             </select>
           </div>
           <div class="chat-summary-row">
-            <div class="menu_button" id="chat_summary_refresh_wb">🔄 刷新列表</div>
+            <div class="menu_button" id="chat_summary_refresh_wb">🔄 刷新世界书列表</div>
           </div>
           <div class="chat-summary-row">
             <label>小总结条目名</label>
@@ -647,24 +749,6 @@ function createUI() {
             <label>大总结条目名</label>
             <input type="text" id="chat_summary_big_entry" class="text_pole" value="大总结">
           </div>
-        </div>
-        
-        <!-- 预览 -->
-        <div class="chat-summary-section">
-          <div class="chat-summary-section-title">👁️ 待总结内容预览</div>
-          <div class="chat-summary-row">
-            <div class="menu_button" id="chat_summary_show_preview">📄 查看待总结内容</div>
-          </div>
-          <div class="chat-summary-preview" id="chat_summary_preview">点击上方按钮查看</div>
-        </div>
-        
-        <!-- 操作按钮 -->
-        <div class="chat-summary-buttons">
-          <div class="menu_button" id="chat_summary_gen_small">✨ 生成小总结</div>
-          <div class="menu_button" id="chat_summary_gen_big">📚 生成大总结</div>
-        </div>
-        <div class="chat-summary-buttons">
-          <div class="menu_button menu_button_danger" id="chat_summary_clear">🗑️ 清空总结</div>
         </div>
         
       </div>
@@ -678,14 +762,8 @@ function createUI() {
 function bindEvents() {
   const settings = getSettings();
   
-  // 基本开关
   $("#chat_summary_enabled").on("change", function() {
     settings.enabled = $(this).prop("checked");
-    saveSettings();
-  });
-  
-  $("#chat_summary_auto").on("change", function() {
-    settings.autoSummary = $(this).prop("checked");
     saveSettings();
   });
   
@@ -714,25 +792,13 @@ function bindEvents() {
   $("#chat_summary_fetch_models").on("click", fetchModels);
   
   // 小总结设置
-  $("#chat_summary_interval").on("change", function() {
-    settings.summaryInterval = parseInt($(this).val()) || 3;
-    saveSettings();
-    updateUI();
-  });
-  
-  $("#chat_summary_context").on("change", function() {
-    settings.contextTurns = parseInt($(this).val()) || 5;
+  $("#chat_summary_floor_range").on("change", function() {
+    settings.floorRange = $(this).val() || "0-10";
     saveSettings();
   });
   
-  // 大总结设置
-  $("#chat_summary_threshold").on("change", function() {
-    settings.bigSummaryThreshold = parseInt($(this).val()) || 10;
-    saveSettings();
-  });
-  
-  $("#chat_summary_keep").on("change", function() {
-    settings.bigSummaryKeepCount = parseInt($(this).val()) || 5;
+  $("#chat_summary_exclude").on("change", function() {
+    settings.excludePattern = $(this).val();
     saveSettings();
   });
   
@@ -740,6 +806,7 @@ function bindEvents() {
   $("#chat_summary_worldbook").on("change", function() {
     settings.selectedWorldbook = $(this).val();
     saveSettings();
+    console.log("[聊天总结] 选择世界书:", settings.selectedWorldbook);
   });
   
   $("#chat_summary_refresh_wb").on("click", updateWorldbookSelect);
@@ -754,13 +821,9 @@ function bindEvents() {
     saveSettings();
   });
   
-  // 预览
-  $("#chat_summary_show_preview").on("click", showPreview);
-  
   // 操作按钮
-  $("#chat_summary_gen_small").on("click", generateSmallSummary);
+  $("#chat_summary_gen_small").on("click", previewSmallSummary);
   $("#chat_summary_gen_big").on("click", generateBigSummary);
-  $("#chat_summary_clear").on("click", clearSummaries);
   
   console.log("[聊天总结助手] 事件已绑定");
 }
@@ -773,11 +836,10 @@ jQuery(async () => {
   loadSettings();
   bindEvents();
   
-  // 初始化世界书列表
-  await updateWorldbookSelect();
-  
-  // 监听消息事件
-  eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+  // 延迟初始化世界书列表
+  setTimeout(async () => {
+    await updateWorldbookSelect();
+  }, 2000);
   
   console.log("[聊天总结助手] 扩展已加载完成");
 });
