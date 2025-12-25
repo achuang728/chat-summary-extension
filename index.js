@@ -12,7 +12,6 @@ const defaultSettings = {
   apiUrl: "",
   apiKey: "",
   apiModel: "",
-  availableModels: [],
   
   // 小总结设置
   floorRange: "0-10",
@@ -77,6 +76,7 @@ function getSettings() {
 
 // ============ API调用 ============
 
+// 通过酒馆代理请求自定义API
 async function callCustomApi(prompt) {
   const settings = getSettings();
   
@@ -84,13 +84,12 @@ async function callCustomApi(prompt) {
     throw new Error("请先配置API地址、密钥和模型");
   }
   
-  // 处理URL，确保格式正确
+  // 处理URL
   let baseUrl = settings.apiUrl.trim();
   if (baseUrl.endsWith("/")) {
     baseUrl = baseUrl.slice(0, -1);
   }
   
-  // 如果用户已经带了/v1就不再加
   let apiEndpoint;
   if (baseUrl.endsWith("/v1")) {
     apiEndpoint = baseUrl + "/chat/completions";
@@ -98,110 +97,98 @@ async function callCustomApi(prompt) {
     apiEndpoint = baseUrl + "/v1/chat/completions";
   }
   
-  const response = await fetch(apiEndpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${settings.apiKey}`
-    },
-    body: JSON.stringify({
-      model: settings.apiModel,
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 2000
-    })
-  });
-  
-  if (!response.ok) {
-    throw new Error(`API请求失败: ${response.status}`);
-  }
-  
-  const data = await response.json();
-  return data.choices[0].message.content;
-}
-
-async function fetchModels() {
-  const settings = getSettings();
-  
-  if (!settings.apiUrl || !settings.apiKey) {
-    toastr.warning("请先填写API地址和密钥", "聊天总结");
-    return;
-  }
-  
+  // 通过酒馆的代理请求
   try {
-    toastr.info("正在获取模型列表...", "聊天总结");
-    
-    // 处理URL
-    let baseUrl = settings.apiUrl.trim();
-    if (baseUrl.endsWith("/")) {
-      baseUrl = baseUrl.slice(0, -1);
-    }
-    
-    // 尝试多种路径
-    let models = [];
-    const urlsToTry = [];
-    
-    if (baseUrl.endsWith("/v1")) {
-      urlsToTry.push(baseUrl + "/models");
-    } else {
-      urlsToTry.push(baseUrl + "/v1/models");
-      urlsToTry.push(baseUrl + "/models");
-    }
-    
-    for (const url of urlsToTry) {
-      try {
-        console.log("[聊天总结] 尝试获取模型:", url);
-        const response = await fetch(url, {
-          headers: {
-            "Authorization": `Bearer ${settings.apiKey}`
-          }
-        });
-        
-        if (response.ok) {
-          const data = await response.json();
-          
-          // 处理不同格式的返回
-          if (data.data && Array.isArray(data.data)) {
-            models = data.data.map(m => m.id || m.name || m).filter(Boolean);
-          } else if (Array.isArray(data)) {
-            models = data.map(m => m.id || m.name || m).filter(Boolean);
-          } else if (data.models && Array.isArray(data.models)) {
-            models = data.models.map(m => m.id || m.name || m).filter(Boolean);
-          }
-          
-          if (models.length > 0) {
-            console.log("[聊天总结] 成功获取模型从:", url);
-            break;
-          }
-        }
-      } catch (e) {
-        console.log("[聊天总结] 该路径失败:", url, e.message);
-      }
-    }
-    
-    if (models.length === 0) {
-      throw new Error("无法获取模型列表，请检查API地址和密钥");
-    }
-    
-    models.sort();
-    settings.availableModels = models;
-    saveSettings();
-    
-    const $select = $("#chat_summary_model");
-    $select.empty();
-    $select.append(`<option value="">-- 选择模型 --</option>`);
-    models.forEach(model => {
-      $select.append(`<option value="${model}">${model}</option>`);
+    const response = await fetch("/api/backends/custom/generate", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        url: apiEndpoint,
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${settings.apiKey}`
+        },
+        body: JSON.stringify({
+          model: settings.apiModel,
+          messages: [{ role: "user", content: prompt }],
+          max_tokens: 2000
+        })
+      })
     });
     
-    if (settings.apiModel) {
-      $select.val(settings.apiModel);
+    if (response.ok) {
+      const data = await response.json();
+      if (data.choices && data.choices[0]) {
+        return data.choices[0].message.content;
+      }
     }
-    
-    toastr.success(`获取到 ${models.length} 个模型`, "聊天总结");
   } catch (e) {
-    console.error("[聊天总结] 获取模型失败:", e);
-    toastr.error("获取模型失败: " + e.message, "聊天总结");
+    console.log("[聊天总结] 代理请求失败，尝试直接请求:", e.message);
   }
+  
+  // 备用：尝试通过 /api/proxy 代理
+  try {
+    const response = await fetch("/api/proxy", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        url: apiEndpoint,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${settings.apiKey}`
+        },
+        body: {
+          model: settings.apiModel,
+          messages: [{ role: "user", content: prompt }],
+          max_tokens: 2000
+        }
+      })
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      if (data.choices && data.choices[0]) {
+        return data.choices[0].message.content;
+      }
+    }
+  } catch (e) {
+    console.log("[聊天总结] proxy请求失败:", e.message);
+  }
+  
+  // 最后尝试：使用酒馆的Text Completion API代理
+  try {
+    const response = await fetch("/api/textgenerationwebui/generate", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        prompt: prompt,
+        max_new_tokens: 2000,
+        api_type: "openai",
+        api_server: baseUrl,
+        api_key: settings.apiKey,
+        model: settings.apiModel
+      })
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      if (data.results && data.results[0]) {
+        return data.results[0].text;
+      }
+    }
+  } catch (e) {
+    console.log("[聊天总结] textgen请求失败:", e.message);
+  }
+  
+  // 都失败了，提示用户
+  throw new Error("API请求失败，请检查配置或使用酒馆自带的API");
 }
 
 async function callAI(prompt) {
@@ -212,6 +199,31 @@ async function callAI(prompt) {
   } else {
     const context = getContext();
     return await context.generateQuietPrompt(prompt, false, false);
+  }
+}
+
+// 测试API连接
+async function testApiConnection() {
+  const settings = getSettings();
+  
+  if (!settings.apiUrl || !settings.apiKey || !settings.apiModel) {
+    toastr.warning("请先填写完整的API配置", "聊天总结");
+    return;
+  }
+  
+  toastr.info("正在测试API连接...", "聊天总结");
+  
+  try {
+    const result = await callCustomApi("请回复：测试成功");
+    if (result) {
+      toastr.success("API连接成功！", "聊天总结");
+      console.log("[聊天总结] API测试响应:", result);
+    } else {
+      toastr.warning("API返回为空", "聊天总结");
+    }
+  } catch (e) {
+    toastr.error("API连接失败: " + e.message, "聊天总结");
+    console.error("[聊天总结] API测试失败:", e);
   }
 }
 
@@ -731,6 +743,7 @@ function updateUI() {
   $("#chat_summary_use_custom_api").prop("checked", settings.useCustomApi);
   $("#chat_summary_api_url").val(settings.apiUrl);
   $("#chat_summary_api_key").val(settings.apiKey);
+  $("#chat_summary_api_model").val(settings.apiModel);
   $("#chat_summary_floor_range").val(settings.floorRange);
   $("#chat_summary_exclude").val(settings.excludePattern);
   $("#chat_summary_small_entry").val(settings.smallSummaryEntryName);
@@ -740,19 +753,6 @@ function updateUI() {
     $("#chat_summary_api_settings").show();
   } else {
     $("#chat_summary_api_settings").hide();
-  }
-  
-  // 模型下拉框
-  if (settings.availableModels && settings.availableModels.length > 0) {
-    const $select = $("#chat_summary_model");
-    if ($select.children().length <= 1) {
-      settings.availableModels.forEach(model => {
-        $select.append(`<option value="${model}">${model}</option>`);
-      });
-    }
-    if (settings.apiModel) {
-      $select.val(settings.apiModel);
-    }
   }
 }
 
@@ -788,21 +788,20 @@ function createUI() {
           <div id="chat_summary_api_settings" style="display: none;">
             <div class="chat-summary-row">
               <label>API地址</label>
-              <input type="text" id="chat_summary_api_url" class="text_pole" placeholder="https://api.example.com">
+              <input type="text" id="chat_summary_api_url" class="text_pole" placeholder="http://127.0.0.1:8888">
             </div>
             <div class="chat-summary-row">
               <label>API密钥</label>
               <input type="password" id="chat_summary_api_key" class="text_pole" placeholder="sk-xxx">
             </div>
             <div class="chat-summary-row">
-              <label>模型</label>
-              <select id="chat_summary_model" class="text_pole">
-                <option value="">-- 选择模型 --</option>
-              </select>
+              <label>模型名称</label>
+              <input type="text" id="chat_summary_api_model" class="text_pole" placeholder="直接输入模型名，如 gpt-3.5-turbo">
             </div>
             <div class="chat-summary-row">
-              <div class="menu_button" id="chat_summary_fetch_models">🔄 获取模型列表</div>
+              <div class="menu_button" id="chat_summary_test_api">🔗 测试API连接</div>
             </div>
+            <p style="font-size: 11px; opacity: 0.6; margin-top: 5px;">提示：模型名称需要手动输入，可在API后端查看可用模型</p>
           </div>
         </div>
         
@@ -886,12 +885,12 @@ function bindEvents() {
     saveSettings();
   });
   
-  $("#chat_summary_model").on("change", function() {
-    settings.apiModel = $(this).val();
+  $("#chat_summary_api_model").on("change", function() {
+    settings.apiModel = $(this).val().trim();
     saveSettings();
   });
   
-  $("#chat_summary_fetch_models").on("click", fetchModels);
+  $("#chat_summary_test_api").on("click", testApiConnection);
   
   // 小总结设置
   $("#chat_summary_floor_range").on("change", function() {
