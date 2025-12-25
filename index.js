@@ -1,7 +1,8 @@
-import { extension_settings, getContext, saveSettingsDebounced } from "../../../extensions.js";
+import { extension_settings, getContext } from "../../../extensions.js";
+import { saveSettingsDebounced } from "../../../../script.js";
 import { eventSource, event_types } from "../../../../script.js";
 
-const extensionName = "chat-summary";
+const extensionName = "chat-summary-extension";
 const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
 
 // 默认设置
@@ -74,6 +75,7 @@ function saveSettings() {
 // 更新UI显示
 function updateUI() {
   const settings = extension_settings[extensionName];
+  if (!settings) return;
   
   $("#chat_summary_enabled").prop("checked", settings.enabled);
   $("#chat_summary_auto").prop("checked", settings.autoSummary);
@@ -85,10 +87,10 @@ function updateUI() {
   $("#chat_summary_keywords").val(settings.worldbookKeywords);
   
   $("#chat_summary_turns").text(`${settings.currentTurn}/${settings.summaryInterval}`);
-  $("#chat_summary_count").text(settings.summaries.length);
+  $("#chat_summary_count").text(settings.summaries ? settings.summaries.length : 0);
   
   // 预览
-  if (settings.summaries.length > 0) {
+  if (settings.summaries && settings.summaries.length > 0) {
     const preview = settings.summaries.slice(-3).map((s, i) => 
       `[${settings.summaries.length - 2 + i}] ${s.content.substring(0, 60)}...`
     ).join("\n\n");
@@ -108,31 +110,6 @@ async function callAI(prompt) {
   } catch (e) {
     console.error("[聊天总结] AI调用失败:", e);
     throw e;
-  }
-}
-
-// 更新世界书
-async function updateWorldbook(content) {
-  const settings = extension_settings[extensionName];
-  const context = getContext();
-  
-  try {
-    // 获取角色世界书
-    const charLore = context.characters[context.characterId]?.data?.extensions?.world;
-    if (!charLore) {
-      console.log("[聊天总结] 未找到角色世界书");
-      return false;
-    }
-    
-    // 这里需要用酒馆的API来更新世界书条目
-    // 简化处理：打印到控制台
-    console.log("[聊天总结] 世界书内容:", content);
-    toastr.info("总结已生成，请手动复制到世界书", "聊天总结");
-    
-    return true;
-  } catch (e) {
-    console.error("[聊天总结] 更新世界书失败:", e);
-    return false;
   }
 }
 
@@ -187,6 +164,7 @@ async function generateSmallSummary() {
     
     if (!chatContent.trim()) {
       toastr.warning("没有有效的对话内容", "聊天总结");
+      isProcessing = false;
       return;
     }
     
@@ -197,6 +175,8 @@ async function generateSmallSummary() {
     const summary = await callAI(prompt);
     
     if (summary && summary.trim()) {
+      if (!settings.summaries) settings.summaries = [];
+      
       settings.summaries.push({
         id: Date.now(),
         time: new Date().toLocaleString("zh-CN"),
@@ -283,7 +263,7 @@ async function generateBigSummary() {
 function onMessageReceived() {
   const settings = extension_settings[extensionName];
   
-  if (!settings.enabled || !settings.autoSummary) return;
+  if (!settings || !settings.enabled || !settings.autoSummary) return;
   
   settings.currentTurn++;
   
@@ -300,13 +280,11 @@ function onMessageReceived() {
 
 // 导出总结
 function exportSummaries() {
-  const settings = extension_settings[extensionName];
   const content = formatSummaries();
   
   navigator.clipboard.writeText(content).then(() => {
     toastr.success("已复制到剪贴板", "聊天总结");
   }).catch(() => {
-    // 显示在预览区
     $("#chat_summary_preview").text(content);
     toastr.info("请手动复制预览区内容", "聊天总结");
   });
@@ -414,6 +392,7 @@ function createUI() {
   </div>`;
   
   $("#extensions_settings").append(html);
+  console.log("[聊天总结助手] UI已创建");
 }
 
 // 绑定事件
@@ -465,10 +444,14 @@ function bindEvents() {
   $("#chat_summary_gen_big").on("click", generateBigSummary);
   $("#chat_summary_export").on("click", exportSummaries);
   $("#chat_summary_clear").on("click", clearSummaries);
+  
+  console.log("[聊天总结助手] 事件已绑定");
 }
 
 // 初始化
 jQuery(async () => {
+  console.log("[聊天总结助手] 开始加载...");
+  
   createUI();
   loadSettings();
   bindEvents();
@@ -476,5 +459,5 @@ jQuery(async () => {
   // 监听消息事件
   eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
   
-  console.log("[聊天总结助手] 扩展已加载");
+  console.log("[聊天总结助手] 扩展已加载完成");
 });
