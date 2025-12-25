@@ -1,5 +1,5 @@
 import { extension_settings, getContext } from "../../../extensions.js";
-import { saveSettingsDebounced, getRequestHeaders, generateRaw } from "../../../../script.js";
+import { saveSettingsDebounced, getRequestHeaders, generateRaw, chat_metadata } from "../../../../script.js";
 import { getSortedEntries, saveWorldInfo, loadWorldInfo } from "../../../world-info.js";
 
 // 世界书模块 - 动态获取
@@ -193,6 +193,10 @@ async function getWorldbooks() {
   const worldbookList = [];
   const context = getContext();
   
+  // 调试：打印chat_metadata完整结构
+  console.log("[聊天总结] 导入的chat_metadata:", chat_metadata);
+  console.log("[聊天总结] context.chat_metadata:", context.chat_metadata);
+  
   // 1. 角色绑定的世界书
   if (context.characters && context.characterId !== undefined) {
     const char = context.characters[context.characterId];
@@ -209,11 +213,11 @@ async function getWorldbooks() {
     }
   }
   
-  // 2. 聊天绑定的世界书（聊天知识书）
-  if (context.chat_metadata?.world_info) {
-    const chatWorld = context.chat_metadata.world_info;
+  // 2. 聊天绑定的世界书 - 使用导入的chat_metadata
+  // chat_metadata.world_info 存储聊天绑定的世界书名称
+  if (chat_metadata && chat_metadata.world_info) {
+    const chatWorld = chat_metadata.world_info;
     if (chatWorld && typeof chatWorld === 'string') {
-      // 避免重复
       if (!worldbookList.find(w => w.name === chatWorld)) {
         worldbookList.push({
           name: chatWorld,
