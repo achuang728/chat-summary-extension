@@ -1,5 +1,6 @@
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, getRequestHeaders, generateRaw } from "../../../../script.js";
+import { getSortedEntries, saveWorldInfo, loadWorldInfo } from "../../../world-info.js";
 
 // 世界书模块 - 动态获取
 let worldInfoModule = null;
@@ -189,28 +190,26 @@ async function testCustomApi() {
 // ============ 世界书操作 ============
 
 async function getWorldbooks() {
-  const worldbookList = [];
+  const worldbookSet = new Set();
   
-  $("#world_info option, #world_editor_select option").each(function() {
-    const val = $(this).val();
-    const text = $(this).text().trim();
-    if (val && text && val !== "" && text !== "None" && text !== "无" && !text.includes("选择")) {
-      if (!worldbookList.find(w => w.name === val)) {
-        worldbookList.push({ name: val, displayName: text });
+  try {
+    // 使用酒馆的getSortedEntries获取所有世界书条目
+    const entries = await getSortedEntries();
+    
+    for (const entry of entries) {
+      if (entry.world) {
+        worldbookSet.add(entry.world);
       }
     }
-  });
-  
-  const context = getContext();
-  if (context.characters && context.characterId !== undefined) {
-    const char = context.characters[context.characterId];
-    if (char?.data?.extensions?.world) {
-      const charWorld = char.data.extensions.world;
-      if (!worldbookList.find(w => w.name === charWorld)) {
-        worldbookList.push({ name: charWorld, displayName: `${charWorld} (角色)` });
-      }
-    }
+  } catch (error) {
+    console.error("[聊天总结] 获取世界书列表失败:", error);
   }
+  
+  // 转换为数组格式
+  const worldbookList = Array.from(worldbookSet).map(name => ({
+    name: name,
+    displayName: name
+  }));
   
   console.log("[聊天总结] 世界书列表:", worldbookList);
   return worldbookList;
@@ -247,28 +246,30 @@ async function saveToWorldbook(entryName, content) {
   console.log("[聊天总结] 保存到世界书:", worldbookName, "条目:", entryName);
   
   try {
-    // 先读取现有数据
-    const getResp = await fetch("/api/worldinfo/get", {
-      method: "POST",
-      headers: getRequestHeaders(),
-      body: JSON.stringify({ name: worldbookName })
-    });
+    // 使用酒馆的loadWorldInfo加载世界书
+    let worldData = await loadWorldInfo(worldbookName);
     
-    if (!getResp.ok) {
-      throw new Error("无法读取世界书");
+    if (!worldData) {
+      console.error("[聊天总结] 无法加载世界书:", worldbookName);
+      toastr.error("无法加载世界书: " + worldbookName, "聊天总结");
+      return false;
     }
     
-    const worldData = await getResp.json();
-    const entries = worldData.entries || {};
+    // 确保entries存在
+    if (!worldData.entries) {
+      worldData.entries = {};
+    }
     
-    // 查找或创建条目
+    // 查找现有条目
     let found = false;
-    let targetUid = null;
-    for (const uid in entries) {
-      if (entries[uid].comment === entryName || entries[uid].key?.includes(entryName)) {
-        entries[uid].content = content;
+    
+    for (const uid in worldData.entries) {
+      const entry = worldData.entries[uid];
+      if (entry.comment === entryName || (entry.key && entry.key.includes(entryName))) {
+        // 更新现有条目
+        worldData.entries[uid].content = content;
         found = true;
-        targetUid = uid;
+        console.log("[聊天总结] 更新现有条目 UID:", uid);
         break;
       }
     }
@@ -276,7 +277,7 @@ async function saveToWorldbook(entryName, content) {
     if (!found) {
       // 创建新条目
       const newUid = Date.now();
-      entries[newUid] = {
+      worldData.entries[newUid] = {
         uid: newUid,
         key: [entryName],
         keysecondary: [],
@@ -309,27 +310,14 @@ async function saveToWorldbook(entryName, content) {
         cooldown: null,
         delay: null
       };
+      console.log("[聊天总结] 创建新条目 UID:", newUid);
     }
     
-    // 保存世界书
-    const saveResp = await fetch("/api/worldinfo/edit", {
-      method: "POST",
-      headers: getRequestHeaders(),
-      body: JSON.stringify({
-        name: worldbookName,
-        data: { entries }
-      })
-    });
+    // 使用酒馆的saveWorldInfo保存，第三个参数true表示立即保存
+    await saveWorldInfo(worldbookName, worldData, true);
+    console.log("[聊天总结] 世界书保存成功");
+    return true;
     
-    if (saveResp.ok) {
-      console.log("[聊天总结] 世界书保存成功");
-      return true;
-    } else {
-      const errText = await saveResp.text();
-      console.error("[聊天总结] 保存失败:", errText);
-      toastr.error("保存世界书失败", "聊天总结");
-      return false;
-    }
   } catch (error) {
     console.error("[聊天总结] 保存世界书失败:", error);
     toastr.error("保存世界书失败: " + error.message, "聊天总结");
@@ -344,20 +332,19 @@ async function readFromWorldbook(entryName) {
   if (!worldbookName) return null;
   
   try {
-    const response = await fetch("/api/worldinfo/get", {
-      method: "POST",
-      headers: getRequestHeaders(),
-      body: JSON.stringify({ name: worldbookName })
-    });
+    // 使用酒馆的loadWorldInfo加载世界书
+    const worldData = await loadWorldInfo(worldbookName);
     
-    if (!response.ok) return null;
+    if (!worldData || !worldData.entries) {
+      console.log("[聊天总结] 世界书不存在或为空:", worldbookName);
+      return null;
+    }
     
-    const worldData = await response.json();
-    const entries = worldData.entries || {};
-    
-    for (const uid in entries) {
-      if (entries[uid].comment === entryName || entries[uid].key?.includes(entryName)) {
-        return entries[uid].content;
+    // 查找条目
+    for (const uid in worldData.entries) {
+      const entry = worldData.entries[uid];
+      if (entry.comment === entryName || (entry.key && entry.key.includes(entryName))) {
+        return entry.content;
       }
     }
     
