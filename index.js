@@ -79,6 +79,26 @@ function getSettings() {
 
 // ============ API调用 ============
 
+// 构建正确的API端点URL
+function buildApiEndpoint(apiUrl) {
+  let url = apiUrl.trim().replace(/\/+$/, "");
+  
+  // 如果已经包含完整路径，直接返回
+  if (url.endsWith("/chat/completions")) {
+    return url;
+  }
+  // 如果包含 /v1 但不完整
+  if (url.endsWith("/v1")) {
+    return `${url}/chat/completions`;
+  }
+  // 如果包含 /v1/ 在中间
+  if (url.includes("/v1/") && !url.endsWith("/chat/completions")) {
+    return url.replace(/\/v1\/.*$/, "/v1/chat/completions");
+  }
+  // 默认添加完整路径
+  return `${url}/v1/chat/completions`;
+}
+
 async function callCustomApi(prompt) {
   const settings = getSettings();
   
@@ -86,32 +106,117 @@ async function callCustomApi(prompt) {
     throw new Error("请先配置API地址、密钥和模型");
   }
   
-  let baseUrl = settings.apiUrl.trim().replace(/\/+$/, "");
-  let endpoint = baseUrl.includes("/v1") ? `${baseUrl}/chat/completions` : `${baseUrl}/v1/chat/completions`;
-  
+  const endpoint = buildApiEndpoint(settings.apiUrl);
   console.log("[聊天总结] 调用自定义API:", endpoint);
   
-  const response = await fetch(endpoint, {
+  const requestBody = {
+    model: settings.apiModel,
+    messages: [{ role: "user", content: prompt }],
+    max_tokens: 2000,
+    temperature: 0.7
+  };
+  
+  try {
+    // 首先尝试直接请求
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${settings.apiKey}`
+      },
+      body: JSON.stringify(requestBody)
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`API错误 ${response.status}: ${errorText}`);
+    }
+    
+    const data = await response.json();
+    return data.choices[0].message.content;
+    
+  } catch (error) {
+    // 如果是CORS错误，尝试通过酒馆代理
+    if (error.message.includes("Failed to fetch") || error.message.includes("CORS")) {
+      console.log("[聊天总结] 检测到CORS问题，尝试通过酒馆代理...");
+      return await callCustomApiViaProxy(endpoint, requestBody, settings.apiKey);
+    }
+    throw error;
+  }
+}
+
+// 通过酒馆代理调用API（绕过CORS）
+async function callCustomApiViaProxy(endpoint, requestBody, apiKey) {
+  console.log("[聊天总结] 使用酒馆代理调用API");
+  
+  const response = await fetch("/api/backends/custom/generate", {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${settings.apiKey}`
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      model: settings.apiModel,
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 2000,
-      temperature: 0.7
+      url: endpoint,
+      body: requestBody,
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      }
     })
   });
   
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`API错误 ${response.status}: ${errorText}`);
+    // 如果酒馆代理也失败，尝试备用方案
+    console.log("[聊天总结] 酒馆代理失败，尝试备用方案...");
+    return await callCustomApiViaBypass(endpoint, requestBody, apiKey);
   }
   
   const data = await response.json();
-  return data.choices[0].message.content;
+  return data.choices?.[0]?.message?.content || data.content || data;
+}
+
+// 备用方案：通过酒馆的通用代理端点
+async function callCustomApiViaBypass(endpoint, requestBody, apiKey) {
+  // 尝试使用 /proxy 端点
+  const response = await fetch("/proxy", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Real-URL": endpoint,
+      "X-Real-Method": "POST",
+      "X-Real-Headers": JSON.stringify({
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      })
+    },
+    body: JSON.stringify(requestBody)
+  });
+  
+  if (!response.ok) {
+    throw new Error(`代理请求失败。请在API服务器启用CORS，或检查API配置。\n\n解决方案：\n1. 如果是llama.cpp: 添加 --cors 参数\n2. 如果是Ollama: 设置 OLLAMA_ORIGINS=*\n3. 如果是text-gen-webui: 启用 --api-cors`);
+  }
+  
+  const data = await response.json();
+  return data.choices?.[0]?.message?.content || data.content || data;
+}
+
+// 测试API连接
+async function testCustomApi() {
+  const settings = getSettings();
+  
+  if (!settings.apiUrl || !settings.apiKey || !settings.apiModel) {
+    toastr.warning("请先填写API地址、密钥和模型", "聊天总结");
+    return;
+  }
+  
+  toastr.info("正在测试API连接...", "聊天总结");
+  
+  try {
+    const result = await callCustomApi("请回复'API连接成功'这四个字");
+    toastr.success(`API测试成功！\n回复: ${result.substring(0, 50)}...`, "聊天总结", { timeOut: 5000 });
+  } catch (error) {
+    toastr.error(`API测试失败: ${error.message}`, "聊天总结", { timeOut: 10000 });
+    console.error("[聊天总结] API测试失败:", error);
+  }
 }
 
 async function callAI(prompt) {
@@ -632,6 +737,7 @@ function createUI() {
               <label>模型名称</label>
               <input type="text" id="chat_summary_api_model" class="text_pole" placeholder="gpt-3.5-turbo">
             </div>
+            <div class="menu_button" id="chat_summary_test_api" style="margin-top:8px;">🔍 测试API连接</div>
           </div>
         </div>
         
@@ -714,6 +820,8 @@ function bindEvents() {
     settings.apiModel = $(this).val().trim();
     saveSettings();
   });
+  
+  $("#chat_summary_test_api").on("click", testCustomApi);
   
   $("#chat_summary_worldbook").on("change", function() {
     settings.selectedWorldbook = $(this).val();
