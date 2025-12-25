@@ -27,20 +27,43 @@
   opacity: 0.7;
 }
 
+.chat-summary-section {
+  margin-bottom: 15px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+}
+
+.chat-summary-section-title {
+  font-weight: bold;
+  margin-bottom: 10px;
+  color: #667eea;
+  font-size: 13px;
+}
+
 .chat-summary-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 8px;
+  gap: 10px;
 }
 
 .chat-summary-row label {
   flex: 1;
+  white-space: nowrap;
 }
 
 .chat-summary-row input[type="number"],
-.chat-summary-row input[type="text"] {
-  width: 100px;
+.chat-summary-row input[type="text"],
+.chat-summary-row input[type="password"],
+.chat-summary-row select {
+  width: 140px;
+  flex-shrink: 0;
+}
+
+.chat-summary-row .menu_button {
+  flex: 1;
+  text-align: center;
 }
 
 .chat-summary-buttons {
@@ -54,21 +77,16 @@
   text-align: center;
 }
 
-.chat-summary-preview-title {
-  font-weight: bold;
-  margin: 12px 0 6px 0;
-  color: #f39c12;
-}
-
 .chat-summary-preview {
   background: rgba(0, 0, 0, 0.2);
   border-radius: 6px;
   padding: 10px;
-  max-height: 150px;
+  max-height: 200px;
   overflow-y: auto;
   font-size: 12px;
   line-height: 1.5;
   white-space: pre-wrap;
+  margin-top: 8px;
 }
 
 .menu_button_danger {
@@ -77,4 +95,11 @@
 
 .menu_button_danger:hover {
   background-color: #c0392b !important;
+}
+
+#chat_summary_api_settings {
+  margin-top: 10px;
+  padding: 10px;
+  background: rgba(0,0,0,0.15);
+  border-radius: 6px;
 }
