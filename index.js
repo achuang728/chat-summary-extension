@@ -192,17 +192,35 @@ async function testCustomApi() {
 async function getWorldbooks() {
   const worldbookSet = new Set();
   
+  // 方法1：使用酒馆的getSortedEntries获取已加载的世界书
   try {
-    // 使用酒馆的getSortedEntries获取所有世界书条目
     const entries = await getSortedEntries();
-    
     for (const entry of entries) {
       if (entry.world) {
         worldbookSet.add(entry.world);
       }
     }
+    console.log("[聊天总结] 从getSortedEntries获取:", Array.from(worldbookSet));
   } catch (error) {
-    console.error("[聊天总结] 获取世界书列表失败:", error);
+    console.error("[聊天总结] getSortedEntries失败:", error);
+  }
+  
+  // 方法2：从DOM的世界书选择器获取
+  $("#world_info option, #world_editor_select option").each(function() {
+    const val = $(this).val();
+    if (val && val.trim() !== "" && val !== "None") {
+      worldbookSet.add(val);
+    }
+  });
+  
+  // 方法3：获取角色绑定的世界书
+  const context = getContext();
+  if (context.characters && context.characterId !== undefined) {
+    const char = context.characters[context.characterId];
+    if (char?.data?.extensions?.world) {
+      worldbookSet.add(char.data.extensions.world);
+      console.log("[聊天总结] 角色绑定世界书:", char.data.extensions.world);
+    }
   }
   
   // 转换为数组格式
@@ -211,7 +229,7 @@ async function getWorldbooks() {
     displayName: name
   }));
   
-  console.log("[聊天总结] 世界书列表:", worldbookList);
+  console.log("[聊天总结] 最终世界书列表:", worldbookList);
   return worldbookList;
 }
 
