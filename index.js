@@ -84,7 +84,21 @@ async function callCustomApi(prompt) {
     throw new Error("请先配置API地址、密钥和模型");
   }
   
-  const response = await fetch(settings.apiUrl + "/v1/chat/completions", {
+  // 处理URL，确保格式正确
+  let baseUrl = settings.apiUrl.trim();
+  if (baseUrl.endsWith("/")) {
+    baseUrl = baseUrl.slice(0, -1);
+  }
+  
+  // 如果用户已经带了/v1就不再加
+  let apiEndpoint;
+  if (baseUrl.endsWith("/v1")) {
+    apiEndpoint = baseUrl + "/chat/completions";
+  } else {
+    apiEndpoint = baseUrl + "/v1/chat/completions";
+  }
+  
+  const response = await fetch(apiEndpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -116,19 +130,59 @@ async function fetchModels() {
   try {
     toastr.info("正在获取模型列表...", "聊天总结");
     
-    const response = await fetch(settings.apiUrl + "/v1/models", {
-      headers: {
-        "Authorization": `Bearer ${settings.apiKey}`
-      }
-    });
-    
-    if (!response.ok) {
-      throw new Error(`请求失败: ${response.status}`);
+    // 处理URL
+    let baseUrl = settings.apiUrl.trim();
+    if (baseUrl.endsWith("/")) {
+      baseUrl = baseUrl.slice(0, -1);
     }
     
-    const data = await response.json();
-    const models = data.data.map(m => m.id).sort();
+    // 尝试多种路径
+    let models = [];
+    const urlsToTry = [];
     
+    if (baseUrl.endsWith("/v1")) {
+      urlsToTry.push(baseUrl + "/models");
+    } else {
+      urlsToTry.push(baseUrl + "/v1/models");
+      urlsToTry.push(baseUrl + "/models");
+    }
+    
+    for (const url of urlsToTry) {
+      try {
+        console.log("[聊天总结] 尝试获取模型:", url);
+        const response = await fetch(url, {
+          headers: {
+            "Authorization": `Bearer ${settings.apiKey}`
+          }
+        });
+        
+        if (response.ok) {
+          const data = await response.json();
+          
+          // 处理不同格式的返回
+          if (data.data && Array.isArray(data.data)) {
+            models = data.data.map(m => m.id || m.name || m).filter(Boolean);
+          } else if (Array.isArray(data)) {
+            models = data.map(m => m.id || m.name || m).filter(Boolean);
+          } else if (data.models && Array.isArray(data.models)) {
+            models = data.models.map(m => m.id || m.name || m).filter(Boolean);
+          }
+          
+          if (models.length > 0) {
+            console.log("[聊天总结] 成功获取模型从:", url);
+            break;
+          }
+        }
+      } catch (e) {
+        console.log("[聊天总结] 该路径失败:", url, e.message);
+      }
+    }
+    
+    if (models.length === 0) {
+      throw new Error("无法获取模型列表，请检查API地址和密钥");
+    }
+    
+    models.sort();
     settings.availableModels = models;
     saveSettings();
     
@@ -145,6 +199,7 @@ async function fetchModels() {
     
     toastr.success(`获取到 ${models.length} 个模型`, "聊天总结");
   } catch (e) {
+    console.error("[聊天总结] 获取模型失败:", e);
     toastr.error("获取模型失败: " + e.message, "聊天总结");
   }
 }
@@ -163,41 +218,109 @@ async function callAI(prompt) {
 // ============ 世界书操作 ============
 
 async function getWorldbooks() {
+  const worldbookList = [];
+  
   try {
-    const response = await fetch("/api/worldinfo/get-all");
-    if (!response.ok) {
-      // 尝试另一个API
-      const response2 = await fetch("/api/worldinfo");
-      if (!response2.ok) return [];
-      const data2 = await response2.json();
-      return Object.keys(data2.worldInfoData || {});
-    }
-    const data = await response.json();
+    // 方法1: 从SillyTavern的世界书设置获取
+    const response = await fetch("/api/settings/get", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
     
-    // 处理不同格式的返回值
-    if (Array.isArray(data)) {
-      return data;
-    } else if (data.worldInfoData) {
-      return Object.keys(data.worldInfoData);
-    } else if (typeof data === 'object') {
-      return Object.keys(data);
-    }
-    return [];
-  } catch (e) {
-    console.error("[聊天总结] 获取世界书列表失败:", e);
-    
-    // 尝试从页面获取
-    try {
-      const context = getContext();
-      if (context.worldInfo) {
-        return Object.keys(context.worldInfo);
+    if (response.ok) {
+      const settings = await response.json();
+      if (settings.world_info && settings.world_info.globalWorldInfo) {
+        for (const [name, data] of Object.entries(settings.world_info.globalWorldInfo)) {
+          if (name && !worldbookList.find(w => w.name === name)) {
+            worldbookList.push({ name: name, displayName: name });
+          }
+        }
       }
-    } catch (e2) {
-      console.error("[聊天总结] 备用方法也失败:", e2);
+    }
+  } catch (e) {
+    console.log("[聊天总结] 方法1失败:", e.message);
+  }
+  
+  try {
+    // 方法2: 直接获取世界书文件列表
+    const response = await fetch("/api/worldinfo/getnames");
+    if (response.ok) {
+      const names = await response.json();
+      if (Array.isArray(names)) {
+        names.forEach(name => {
+          if (name && !worldbookList.find(w => w.name === name)) {
+            worldbookList.push({ name: name, displayName: name });
+          }
+        });
+      }
+    }
+  } catch (e) {
+    console.log("[聊天总结] 方法2失败:", e.message);
+  }
+  
+  try {
+    // 方法3: 从页面DOM获取世界书下拉框选项
+    $("#world_info option, #world_editor_select option, .world_info_selector option").each(function() {
+      const val = $(this).val();
+      const text = $(this).text().trim();
+      if (val && val !== "" && val !== "None" && val !== "none") {
+        const displayName = text || val;
+        if (!worldbookList.find(w => w.name === val)) {
+          worldbookList.push({ name: val, displayName: displayName });
+        }
+      }
+    });
+  } catch (e) {
+    console.log("[聊天总结] 方法3失败:", e.message);
+  }
+  
+  try {
+    // 方法4: 获取角色绑定的世界书
+    const context = getContext();
+    if (context.characters && context.characterId !== undefined) {
+      const char = context.characters[context.characterId];
+      if (char?.data?.extensions?.world) {
+        const charWorld = char.data.extensions.world;
+        if (charWorld && !worldbookList.find(w => w.name === charWorld)) {
+          worldbookList.push({ name: charWorld, displayName: `${charWorld} (角色绑定)` });
+        }
+      }
     }
     
-    return [];
+    // 获取聊天绑定的世界书
+    if (context.chatMetadata && context.chatMetadata.world_info) {
+      const chatWorld = context.chatMetadata.world_info;
+      if (chatWorld && !worldbookList.find(w => w.name === chatWorld)) {
+        worldbookList.push({ name: chatWorld, displayName: `${chatWorld} (聊天绑定)` });
+      }
+    }
+  } catch (e) {
+    console.log("[聊天总结] 方法4失败:", e.message);
   }
+  
+  try {
+    // 方法5: 列出世界书目录
+    const response = await fetch("/api/worldinfo/list");
+    if (response.ok) {
+      const data = await response.json();
+      if (Array.isArray(data)) {
+        data.forEach(item => {
+          const name = typeof item === 'string' ? item : (item.name || item.filename);
+          if (name && !worldbookList.find(w => w.name === name)) {
+            // 去掉.json后缀显示
+            const displayName = name.replace(/\.json$/i, "");
+            worldbookList.push({ name: name, displayName: displayName });
+          }
+        });
+      }
+    }
+  } catch (e) {
+    console.log("[聊天总结] 方法5失败:", e.message);
+  }
+  
+  console.log("[聊天总结] 找到世界书:", worldbookList);
+  return worldbookList;
 }
 
 async function updateWorldbookSelect() {
@@ -207,45 +330,24 @@ async function updateWorldbookSelect() {
   $select.empty();
   $select.append(`<option value="">-- 选择世界书 --</option>`);
   
-  // 方法1: 从API获取
+  toastr.info("正在获取世界书列表...", "聊天总结");
+  
   const worldbooks = await getWorldbooks();
   
-  // 方法2: 从页面DOM获取世界书列表
-  const $wbSelect = $("#world_info");
-  if ($wbSelect.length) {
-    $wbSelect.find("option").each(function() {
-      const val = $(this).val();
-      const text = $(this).text();
-      if (val && val !== "" && !worldbooks.includes(val)) {
-        worldbooks.push(val);
-      }
-    });
-  }
-  
-  // 方法3: 从角色世界书获取
-  const context = getContext();
-  if (context.characters && context.characterId !== undefined) {
-    const char = context.characters[context.characterId];
-    if (char?.data?.extensions?.world) {
-      const charWorld = char.data.extensions.world;
-      if (!worldbooks.includes(charWorld)) {
-        worldbooks.push(charWorld);
-      }
-    }
+  if (worldbooks.length === 0) {
+    toastr.warning("未找到世界书，请先创建或导入世界书", "聊天总结");
+    return;
   }
   
   worldbooks.forEach(wb => {
-    const name = typeof wb === 'string' ? wb : (wb.name || wb);
-    if (name) {
-      $select.append(`<option value="${name}">${name}</option>`);
-    }
+    $select.append(`<option value="${wb.name}">${wb.displayName}</option>`);
   });
   
   if (settings.selectedWorldbook) {
     $select.val(settings.selectedWorldbook);
   }
   
-  toastr.info(`找到 ${worldbooks.length} 个世界书`, "聊天总结");
+  toastr.success(`找到 ${worldbooks.length} 个世界书`, "聊天总结");
 }
 
 async function saveToWorldbook(entryName, content) {
