@@ -383,7 +383,7 @@ function getSelectedContent() {
   const context = getContext();
   
   if (!context.chat || context.chat.length === 0) {
-    return { content: "", messages: [] };
+    return { content: "", messages: [], floorRange: "0-0" };
   }
   
   const rangeStr = settings.floorRange || "0-10";
@@ -424,8 +424,9 @@ function getSelectedContent() {
   }
   
   const content = messages.map(m => `[${m.role}]: ${m.text}`).join("\n\n");
+  const floorRange = `${start}-${end}`;
   
-  return { content, messages };
+  return { content, messages, floorRange };
 }
 
 // ============ 弹窗 ============
@@ -492,17 +493,18 @@ function escapeHtml(text) {
 // ============ 核心功能 ============
 
 function previewSmallSummary() {
-  const { content, messages } = getSelectedContent();
+  const settings = getSettings();
+  const { content, messages, floorRange } = getSelectedContent();
   
   if (!content || messages.length === 0) {
     toastr.warning("选中的楼层范围没有内容", "聊天总结");
     return;
   }
   
-  showPreviewPopup(content, () => generateSmallSummary(content));
+  showPreviewPopup(content, () => generateSmallSummary(content, floorRange));
 }
 
-async function generateSmallSummary(content) {
+async function generateSmallSummary(content, floorRange) {
   if (isProcessing) return;
   
   const settings = getSettings();
@@ -521,10 +523,10 @@ async function generateSmallSummary(content) {
     
     if (summary && summary.trim()) {
       let existing = await readFromWorldbook(settings.smallSummaryEntryName) || "";
-      const timestamp = new Date().toLocaleString("zh-CN");
+      const floorLabel = `楼层 ${floorRange}`;
       const newContent = existing 
-        ? `${existing}\n\n---\n\n【${timestamp}】\n${summary.trim()}`
-        : `【${timestamp}】\n${summary.trim()}`;
+        ? `${existing}\n\n---\n\n【${floorLabel}】\n${summary.trim()}`
+        : `【${floorLabel}】\n${summary.trim()}`;
       
       const saved = await saveToWorldbook(settings.smallSummaryEntryName, newContent);
       
@@ -568,7 +570,13 @@ async function generateBigSummary() {
       const result = await callAI(prompt);
       
       if (result && result.trim()) {
-        const saved = await saveToWorldbook(settings.bigSummaryEntryName, result.trim());
+        // 追加模式
+        let existing = await readFromWorldbook(settings.bigSummaryEntryName) || "";
+        const newContent = existing 
+          ? `${existing}\n\n---\n\n${result.trim()}`
+          : result.trim();
+        
+        const saved = await saveToWorldbook(settings.bigSummaryEntryName, newContent);
         
         if (saved) {
           toastr.success("大总结已保存到世界书", "聊天总结");
@@ -685,14 +693,14 @@ function createUI() {
             <label>排除内容(正则)</label>
             <input type="text" id="chat_summary_exclude" class="text_pole" placeholder="<thinking>[\\s\\S]*?</thinking>">
           </div>
-          <div class="menu_button" id="chat_summary_gen_small" style="margin-top:10px;">✨ 生成小总结</div>
+          <div class="menu_button" id="chat_summary_gen_small" style="margin-top:10px;width:100%;text-align:center;">✨ 生成小总结</div>
         </div>
         
         <hr>
         
         <div class="chat-summary-section">
           <b>📚 大总结</b>
-          <div class="menu_button" id="chat_summary_gen_big" style="margin-top:8px;">📚 生成大总结</div>
+          <div class="menu_button" id="chat_summary_gen_big" style="margin-top:8px;width:100%;text-align:center;">📚 生成大总结</div>
           <p style="font-size:11px;opacity:0.6;margin-top:5px;">从世界书小总结条目合并生成</p>
         </div>
         
