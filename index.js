@@ -532,7 +532,7 @@ function getSelectedContent() {
     text = text.trim();
     if (!text) continue;
     
-    const role = msg.is_user ? "用户" : (msg.name || "角色");
+    const role = msg.is_user ? "<user>" : (msg.name || "char");
     messages.push({
       index: i,
       role,
