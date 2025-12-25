@@ -190,66 +190,43 @@ async function testCustomApi() {
 // ============ 世界书操作 ============
 
 async function getWorldbooks() {
-  const worldbookMap = new Map(); // name -> displayName
-  
-  // 方法1：从DOM的世界书选择器获取（这里有完整的名称）
-  // 全局世界书选择器
-  $("#world_info option").each(function() {
-    const val = $(this).val();
-    const text = $(this).text().trim();
-    if (val && val.trim() !== "" && text && text !== "None" && text !== "无" && !text.includes("选择")) {
-      worldbookMap.set(val, text);
-    }
-  });
-  
-  // 世界书编辑器选择器
-  $("#world_editor_select option").each(function() {
-    const val = $(this).val();
-    const text = $(this).text().trim();
-    if (val && val.trim() !== "" && text && text !== "None" && text !== "无" && !text.includes("选择")) {
-      worldbookMap.set(val, text);
-    }
-  });
-  
-  // 角色世界书选择器
-  $("#character_world option").each(function() {
-    const val = $(this).val();
-    const text = $(this).text().trim();
-    if (val && val.trim() !== "" && text && text !== "None" && text !== "无" && !text.includes("选择")) {
-      worldbookMap.set(val, text);
-    }
-  });
-  
-  // 方法2：获取角色绑定的世界书
+  const worldbookList = [];
   const context = getContext();
+  
+  // 1. 角色绑定的世界书
   if (context.characters && context.characterId !== undefined) {
     const char = context.characters[context.characterId];
+    
     if (char?.data?.extensions?.world) {
-      const charWorld = char.data.extensions.world;
-      if (!worldbookMap.has(charWorld)) {
-        worldbookMap.set(charWorld, charWorld + " (角色绑定)");
+      const mainWorld = char.data.extensions.world;
+      if (mainWorld && typeof mainWorld === 'string') {
+        worldbookList.push({
+          name: mainWorld,
+          displayName: mainWorld + " (角色绑定)"
+        });
+        console.log("[聊天总结] 角色绑定世界书:", mainWorld);
       }
-      console.log("[聊天总结] 角色绑定世界书:", charWorld);
     }
   }
   
-  // 方法3：从getSortedEntries获取已激活的世界书
-  try {
-    const entries = await getSortedEntries();
-    for (const entry of entries) {
-      if (entry.world && !worldbookMap.has(entry.world)) {
-        worldbookMap.set(entry.world, entry.world);
+  // 2. 聊天绑定的世界书（聊天知识书）
+  if (context.chat_metadata?.world_info) {
+    const chatWorld = context.chat_metadata.world_info;
+    if (chatWorld && typeof chatWorld === 'string') {
+      // 避免重复
+      if (!worldbookList.find(w => w.name === chatWorld)) {
+        worldbookList.push({
+          name: chatWorld,
+          displayName: chatWorld + " (聊天绑定)"
+        });
+        console.log("[聊天总结] 聊天绑定世界书:", chatWorld);
       }
     }
-  } catch (error) {
-    console.error("[聊天总结] getSortedEntries失败:", error);
   }
   
-  // 转换为数组格式
-  const worldbookList = Array.from(worldbookMap.entries()).map(([name, displayName]) => ({
-    name: name,
-    displayName: displayName
-  }));
+  if (worldbookList.length === 0) {
+    console.log("[聊天总结] 未找到任何世界书");
+  }
   
   console.log("[聊天总结] 最终世界书列表:", worldbookList);
   return worldbookList;
